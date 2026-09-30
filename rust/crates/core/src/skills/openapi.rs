@@ -565,6 +565,11 @@ pub fn validate_committed_openapi_document(
         )));
     }
 
+    if is_openapi3_document(doc) {
+        findings.extend(validate_local_refs(doc));
+        findings.extend(validate_unique_operation_ids(doc));
+    }
+
     findings.extend(validate_server_urls(doc, service_url, sandbox_service_url));
     findings
 }
@@ -861,6 +866,132 @@ fn collect_remote_refs(value: &Value, refs: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+fn is_skipped_local_ref(reference: &str) -> bool {
+    reference.starts_with("http://")
+        || reference.starts_with("https://")
+        || !reference.starts_with('#')
+}
+
+fn validate_local_refs(doc: &Value) -> Vec<CatalogFinding> {
+    let mut findings = Vec::new();
+    collect_local_ref_findings(doc, doc, "", &mut findings);
+    findings
+}
+
+fn collect_local_ref_findings(
+    node: &Value,
+    root: &Value,
+    location: &str,
+    findings: &mut Vec<CatalogFinding>,
+) {
+    match node {
+        Value::Object(map) => {
+            for (key, value) in map {
+                let child_loc = if location.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{location}.{key}")
+                };
+                if key == "$ref"
+                    && let Some(reference) = value.as_str()
+                    && !is_skipped_local_ref(reference)
+                    && let Err(reason) = check_local_ref(reference, root)
+                {
+                    let at = if location.is_empty() {
+                        "$".to_string()
+                    } else {
+                        location.to_string()
+                    };
+                    findings.push(CatalogFinding::error(format!(
+                        "OpenAPI document contains unresolved local `$ref` `{reference}` at `{at}`\n  \
+                         {reason}"
+                    )));
+                }
+                collect_local_ref_findings(value, root, &child_loc, findings);
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let child_loc = if location.is_empty() {
+                    format!("[{index}]")
+                } else {
+                    format!("{location}[{index}]")
+                };
+                collect_local_ref_findings(value, root, &child_loc, findings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_local_ref(reference: &str, root: &Value) -> std::result::Result<(), String> {
+    let Some(pointer) = reference.strip_prefix('#') else {
+        return Err("local $ref must start with '#'".into());
+    };
+    if !pointer.is_empty() && !pointer.starts_with('/') {
+        return Err("JSON Pointer must be empty or start with '/'".into());
+    }
+    validate_pointer_escapes(pointer)?;
+    if root.pointer(pointer).is_none() {
+        return Err("target does not exist".into());
+    }
+    Ok(())
+}
+
+fn validate_pointer_escapes(pointer: &str) -> std::result::Result<(), String> {
+    let mut chars = pointer.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            match chars.next() {
+                Some('0') | Some('1') => {}
+                _ => {
+                    return Err(
+                        "malformed JSON Pointer escape (expected ~0 or ~1)".into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_operation_ids(doc: &Value) -> Vec<CatalogFinding> {
+    let mut findings = Vec::new();
+    let Some(paths) = doc.get("paths").and_then(Value::as_object) else {
+        return findings;
+    };
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (path, item) in paths {
+        let Some(item_obj) = item.as_object() else {
+            continue;
+        };
+        for &method in HTTP_METHODS {
+            let Some(id) = item_obj
+                .get(method)
+                .and_then(|op| op.get("operationId"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let location = format!("paths.{path}.{method}");
+            if let Some(first) = seen.get(id) {
+                findings.push(CatalogFinding::error(format!(
+                    "OpenAPI operationId `{id}` is duplicated\n  \
+                     first: `{first}`\n  \
+                     also: `{location}`"
+                )));
+            } else {
+                seen.insert(id.to_string(), location);
+            }
+        }
+    }
+    findings
 }
 
 fn validate_server_urls(
@@ -3434,6 +3565,151 @@ mod tests {
     }
 
     // ── Operation-documentation tests ──
+
+    #[test]
+    fn committed_openapi_validation_accepts_resolvable_local_ref() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "User": { "type": "object" },
+                    "Alias": { "$ref": "#/components/schemas/User" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error),
+            "expected no errors, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_escaped_json_pointer_tokens() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "a/b": { "type": "string" },
+                    "a~b": { "type": "string" },
+                    "UsesSlash": { "$ref": "#/components/schemas/a~1b" },
+                    "UsesTilde": { "$ref": "#/components/schemas/a~0b" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            "escaped pointers should resolve, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_missing_local_ref() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Alias": { "$ref": "#/components/schemas/Missing" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            findings.iter().any(|f| {
+                f.severity == CatalogFindingSeverity::Error
+                    && f.message.contains("#/components/schemas/Missing")
+                    && f.message.contains("components.schemas.Alias")
+            }),
+            "expected missing-target error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_malformed_local_pointer() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "BadEscape": { "$ref": "#/foo~2" },
+                    "NoSlash": { "$ref": "#foo" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let messages: Vec<_> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("#/foo~2") && m.contains("malformed")),
+            "expected malformed escape error, got: {findings:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("#foo") && m.contains("start with '/'")),
+            "expected missing-slash pointer error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_duplicate_operation_ids() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/a": { "get": { "operationId": "listThings", "summary": "List the available things now" } },
+                "/b": { "post": { "operationId": "listThings", "summary": "Create a thing from the payload" } }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            findings.iter().any(|f| {
+                f.severity == CatalogFindingSeverity::Error
+                    && f.message.contains("operationId `listThings`")
+                    && f.message.contains("paths./a.get")
+                    && f.message.contains("paths./b.post")
+            }),
+            "expected duplicate operationId error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_ignores_blank_operation_ids() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/a": { "get": { "operationId": "   " } },
+                "/b": { "post": { "operationId": "" } }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("operationId")),
+            "blank operationIds are out of scope, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_skips_discovery_docs() {
+        let doc = json!({
+            "kind": "discovery#restDescription",
+            "resources": {
+                "files": { "methods": { "get": { "httpMethod": "GET", "path": "files" } } }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("operationId") || f.message.contains("unresolved local")),
+            "discovery docs must be unchanged, got: {findings:?}"
+        );
+    }
 
     #[test]
     fn operation_doc_validation_flags_undeclared_path_placeholder() {
