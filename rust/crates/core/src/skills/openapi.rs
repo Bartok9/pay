@@ -900,9 +900,15 @@ fn collect_local_ref_findings(
                 } else {
                     format!("{location}.{key}")
                 };
-                // Example payloads are data, not schema. A literal `$ref`
-                // field in an example must not be treated as a reference.
-                if key == "example" || key == "examples" {
+                // `example` is always a payload. `examples` is either a JSON
+                // Schema value array (payload) or an OpenAPI map of Example
+                // Objects. The map's own `$ref` is a real reference; `value`
+                // inside an Example Object is still payload.
+                if key == "example" {
+                    continue;
+                }
+                if key == "examples" {
+                    collect_example_object_refs(value, root, &child_loc, findings);
                     continue;
                 }
                 if key == "$ref"
@@ -934,6 +940,35 @@ fn collect_local_ref_findings(
             }
         }
         _ => {}
+    }
+}
+
+/// OpenAPI `examples` maps (media type, parameter, or `components.examples`)
+/// hold Example Objects or Reference Objects. JSON Schema `examples` is an
+/// array of raw values and must stay skipped.
+fn collect_example_object_refs(
+    node: &Value,
+    root: &Value,
+    location: &str,
+    findings: &mut Vec<CatalogFinding>,
+) {
+    let Value::Object(map) = node else {
+        return;
+    };
+    for (name, example) in map {
+        let child_loc = format!("{location}.{name}");
+        let Some(example) = example.as_object() else {
+            continue;
+        };
+        if let Some(reference) = example.get("$ref").and_then(Value::as_str)
+            && !is_skipped_local_ref(reference)
+            && let Err(reason) = check_local_ref(reference, root)
+        {
+            findings.push(CatalogFinding::error(format!(
+                "OpenAPI document contains unresolved local `$ref` `{reference}` at `{child_loc}`\n  \
+                 {reason}"
+            )));
+        }
     }
 }
 
@@ -3744,6 +3779,56 @@ mod tests {
         assert!(
             !findings.iter().any(|f| f.message.contains("unresolved local")),
             "example $ref fields are data, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_unresolved_example_object_refs() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/echo": {
+                    "get": {
+                        "summary": "Echo with a referenced example",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object" },
+                                        "examples": {
+                                            "sample": { "$ref": "#/components/examples/Missing" },
+                                            "inline": { "value": { "$ref": "payload-data" } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "examples": {
+                    "Broken": { "$ref": "#/components/examples/AlsoMissing" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let messages: Vec<_> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/Missing")
+                && m.contains("responses.200.content.application/json.examples.sample")),
+            "expected media-type example ref error, got: {findings:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/AlsoMissing")
+                && m.contains("components.examples.Broken")),
+            "expected components.examples ref error, got: {findings:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("payload-data")),
+            "example value $ref is payload, got: {findings:?}"
         );
     }
 
