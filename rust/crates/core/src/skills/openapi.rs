@@ -1001,17 +1001,51 @@ fn location_segments(location: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// A media type runs until the next location key (`.examples`, `.schema`,
-/// `.example`, `.encoding`), not the next dot inside the type itself.
+/// A media type runs until the next location key, not the next dot inside
+/// the type itself (`application/vnd.x-widget+json`).
+///
+/// Known Media Type Object fields (`.examples`, `.schema`, `.example`,
+/// `.encoding`) end the type. A vendor extension does too, but only as its
+/// own segment (`application/json.x-documentation`). A dotted subtype such
+/// as `vnd.x-widget+json` is not an extension: the `+` keeps it inside the
+/// media type.
 fn split_media_type(rest: &str) -> (&str, &str) {
     const TAILS: &[&str] = &[".examples", ".schema", ".example", ".encoding"];
-    let cut = TAILS
-        .iter()
-        .filter_map(|tail| rest.find(tail))
-        .min()
-        .unwrap_or(rest.len());
+    let mut cut = rest.len();
+    for tail in TAILS {
+        if let Some(at) = rest.find(tail) {
+            let boundary = at + tail.len();
+            if boundary == rest.len() || rest[boundary..].starts_with('.') {
+                cut = cut.min(at);
+            }
+        }
+    }
+    let mut search = rest;
+    let mut base = 0;
+    while let Some(dot) = search.find('.') {
+        let at = base + dot;
+        let segment = search[dot + 1..].split('.').next().unwrap_or("");
+        if is_vendor_extension_segment(segment) {
+            cut = cut.min(at);
+            break;
+        }
+        base = at + 1;
+        search = &rest[base..];
+    }
     let (media, after) = rest.split_at(cut);
     (media, after.strip_prefix('.').unwrap_or(after))
+}
+
+/// OpenAPI vendor-extension keys are a single `x-` segment. `x-widget+json`
+/// is a media subtype, not an extension.
+fn is_vendor_extension_segment(segment: &str) -> bool {
+    let Some(name) = segment.strip_prefix("x-") else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// OpenAPI `examples` maps (media type, parameter, or `components.examples`)
@@ -3936,6 +3970,61 @@ mod tests {
             !findings.iter().any(|f| f.message.contains("unresolved local")
                 || f.message.contains("not-a-schema-pointer")),
             "vendor-extension examples are payload, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_literal_ref_in_media_type_extension() {
+        // `x-documentation` under a Media Type Object is a vendor extension,
+        // not part of the media type. A literal `$ref` in its payload must
+        // not fail catalog check. A sibling OpenAPI `examples` map still does.
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/widgets": {
+                    "get": {
+                        "summary": "List widgets",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object" },
+                                        "x-documentation": {
+                                            "examples": {
+                                                "raw": { "$ref": "not-a-schema-pointer" }
+                                            }
+                                        }
+                                    },
+                                    "application/vnd.x-widget+json": {
+                                        "schema": { "type": "object" },
+                                        "examples": {
+                                            "sample": { "$ref": "#/components/examples/MissingMedia" }
+                                        },
+                                        "x-documentation": {
+                                            "examples": {
+                                                "raw": { "$ref": "also-payload" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let messages: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("not-a-schema-pointer") || m.contains("also-payload")),
+            "media-type extension examples are payload, got: {findings:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/MissingMedia")
+                && m.contains("application/vnd.x-widget+json.examples.sample")),
+            "dotted media-type example ref should still fail, got: {findings:?}"
         );
     }
 
