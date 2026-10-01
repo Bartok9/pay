@@ -541,6 +541,31 @@ fn raw_to_outcome(raw: RawResponse) -> RunOutcome {
     }
 }
 
+/// Path, query, and fragment to append to `PAY_DEBUGGER_PROXY`.
+///
+/// Does not panic on missing `://`. A host-only URL becomes `/`; a host with
+/// a query but no slash becomes `/?…` so the query is not dropped.
+fn debugger_proxy_path(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return if url.starts_with('/') {
+            url.to_string()
+        } else {
+            "/".to_string()
+        };
+    };
+    let after_scheme = &url[scheme_end + 3..];
+    if let Some(slash) = after_scheme.find('/') {
+        return after_scheme[slash..].to_string();
+    }
+    if let Some(q) = after_scheme.find('?') {
+        return format!("/{}", &after_scheme[q..]);
+    }
+    if let Some(hash) = after_scheme.find('#') {
+        return format!("/{}", &after_scheme[hash..]);
+    }
+    "/".to_string()
+}
+
 fn fetch_raw_with_method(
     client_app: ClientApp,
     method: Method,
@@ -561,11 +586,7 @@ fn fetch_raw_with_method(
     // the traffic. The original URL is passed in X-Pay-Forward-To.
     let (actual_url, forward_header) = if let Ok(proxy) = std::env::var("PAY_DEBUGGER_PROXY") {
         // Rewrite: https://gateway/path → http://127.0.0.1:1402/path
-        let path = url
-            .find("://")
-            .and_then(|i| url[i + 3..].find('/'))
-            .map(|i| &url[url.find("://").unwrap() + 3 + i..])
-            .unwrap_or("/");
+        let path = debugger_proxy_path(url);
         let proxy_url = format!("{}{}", proxy.trim_end_matches('/'), path);
         debug!(%url, %proxy_url, "Routing through debugger proxy");
         (proxy_url, Some(url.to_string()))
@@ -627,6 +648,23 @@ fn fetch_raw_with_method(
         headers,
         body,
     })
+}
+
+#[cfg(test)]
+mod debugger_proxy_path_tests {
+    use super::debugger_proxy_path;
+
+    #[test]
+    fn debugger_proxy_path_keeps_path_and_query() {
+        assert_eq!(
+            debugger_proxy_path("https://gw.example/paid?x=1"),
+            "/paid?x=1"
+        );
+        assert_eq!(debugger_proxy_path("http://127.0.0.1:1402/a/b"), "/a/b");
+        assert_eq!(debugger_proxy_path("https://gw.example"), "/");
+        assert_eq!(debugger_proxy_path("https://gw.example?x=1"), "/?x=1");
+        assert_eq!(debugger_proxy_path("/already"), "/already");
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
