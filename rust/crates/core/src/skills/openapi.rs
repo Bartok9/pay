@@ -27,6 +27,12 @@ use tracing::debug;
 use crate::{Error, Result};
 
 const HTTP_METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
+
+/// Methods that may carry an `operationId`. Includes verbs the catalog does
+/// not otherwise advertise so a HEAD/OPTIONS/TRACE duplicate is not silent.
+const OPERATION_ID_METHODS: &[&str] = &[
+    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+];
 const FETCH_TIMEOUT_SECS: u64 = 15;
 const MAX_SCHEMA_DEPTH: u32 = 6;
 const MAX_COMMITTED_OPENAPI_BYTES: u64 = 1_048_576;
@@ -894,6 +900,11 @@ fn collect_local_ref_findings(
                 } else {
                     format!("{location}.{key}")
                 };
+                // Example payloads are data, not schema. A literal `$ref`
+                // field in an example must not be treated as a reference.
+                if key == "example" || key == "examples" {
+                    continue;
+                }
                 if key == "$ref"
                     && let Some(reference) = value.as_str()
                     && !is_skipped_local_ref(reference)
@@ -933,11 +944,45 @@ fn check_local_ref(reference: &str, root: &Value) -> std::result::Result<(), Str
     if !pointer.is_empty() && !pointer.starts_with('/') {
         return Err("JSON Pointer must be empty or start with '/'".into());
     }
-    validate_pointer_escapes(pointer)?;
-    if root.pointer(pointer).is_none() {
+    let decoded = percent_decode_pointer(pointer)?;
+    validate_pointer_escapes(&decoded)?;
+    if root.pointer(&decoded).is_none() {
         return Err("target does not exist".into());
     }
     Ok(())
+}
+
+/// OpenAPI `$ref` fragments percent-encode characters that are illegal in a
+/// URI fragment (`Foo.Bar` → `Foo%2EBar`). `Value::pointer` expects the
+/// decoded JSON Pointer, including `~0` / `~1` escapes.
+fn percent_decode_pointer(pointer: &str) -> std::result::Result<String, String> {
+    let bytes = pointer.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("malformed percent-encoding in JSON Pointer".into());
+            }
+            let hi = hex_nibble(bytes[i + 1])?;
+            let lo = hex_nibble(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| "JSON Pointer percent-decoding is not UTF-8".into())
+}
+
+fn hex_nibble(byte: u8) -> std::result::Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("malformed percent-encoding in JSON Pointer".into()),
+    }
 }
 
 fn validate_pointer_escapes(pointer: &str) -> std::result::Result<(), String> {
@@ -967,7 +1012,7 @@ fn validate_unique_operation_ids(doc: &Value) -> Vec<CatalogFinding> {
         let Some(item_obj) = item.as_object() else {
             continue;
         };
-        for &method in HTTP_METHODS {
+        for &method in OPERATION_ID_METHODS {
             let Some(id) = item_obj
                 .get(method)
                 .and_then(|op| op.get("operationId"))
@@ -3657,6 +3702,72 @@ mod tests {
     }
 
     #[test]
+    fn committed_openapi_validation_accepts_literal_ref_in_examples() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/echo": {
+                    "post": {
+                        "summary": "Echo a payload that may contain a ref field",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/Envelope" },
+                                    "example": { "$ref": "not-a-schema-pointer" }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/Envelope" },
+                                        "examples": {
+                                            "sample": { "value": { "$ref": "also-data" } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Envelope": { "type": "object" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            "example $ref fields are data, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_percent_encoded_local_ref() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Foo.Bar": { "type": "string" },
+                    "Alias": { "$ref": "#/components/schemas/Foo%2EBar" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            "percent-encoded pointers should resolve, got: {findings:?}"
+        );
+    }
+
+    #[test]
     fn committed_openapi_validation_rejects_duplicate_operation_ids() {
         let doc = json!({
             "openapi": "3.1.0",
@@ -3676,6 +3787,27 @@ mod tests {
             }),
             "expected duplicate operationId error, got: {findings:?}"
         );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_duplicate_operation_ids_on_head_options_trace() {
+        for method in ["head", "options", "trace"] {
+            let doc = json!({
+                "openapi": "3.1.0",
+                "paths": {
+                    "/a": {
+                        "get": { "operationId": "listThings", "summary": "List the available things now" },
+                        method: { "operationId": "listThings" }
+                    }
+                }
+            });
+            let source = OpenapiSource::Content { content: doc.to_string() };
+            let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+            assert!(
+                findings.iter().any(|f| f.message.contains("operationId `listThings`") && f.message.contains(method)),
+                "expected duplicate via {method}, got: {findings:?}"
+            );
+        }
     }
 
     #[test]
