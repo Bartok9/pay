@@ -900,15 +900,18 @@ fn collect_local_ref_findings(
                 } else {
                     format!("{location}.{key}")
                 };
-                // `example` is always a payload. `examples` is either a JSON
-                // Schema value array (payload) or an OpenAPI map of Example
-                // Objects. The map's own `$ref` is a real reference; `value`
-                // inside an Example Object is still payload.
+                // `example` is always a payload. `examples` is an OpenAPI
+                // map of Example Objects only at media type, parameter, or
+                // `components.examples`. JSON Schema `examples` is a value
+                // array. Vendor-extension `examples` is payload even when it
+                // is an object (`x-documentation.examples.raw`).
                 if key == "example" {
                     continue;
                 }
                 if key == "examples" {
-                    collect_example_object_refs(value, root, &child_loc, findings);
+                    if is_openapi_examples_map(location) {
+                        collect_example_object_refs(value, root, &child_loc, findings);
+                    }
                     continue;
                 }
                 if key == "$ref"
@@ -941,6 +944,29 @@ fn collect_local_ref_findings(
         }
         _ => {}
     }
+}
+
+/// True when this parent is a location whose `examples` field is an
+/// OpenAPI map of Example Objects or Reference Objects, not payload.
+///
+/// OpenAPI 3.0/3.1 put that map on a Media Type Object, a Parameter Object
+/// (`in` is required), and `components.examples`. A vendor extension such as
+/// `x-documentation.examples` is not one of those, even if its values look
+/// like `$ref`.
+fn is_openapi_examples_map(parent: &str) -> bool {
+    // Vendor extensions (`x-…`) are payload, including nested `content` or
+    // `parameters` keys a provider may invent.
+    if parent.split('.').any(|seg| seg.starts_with("x-")) {
+        return false;
+    }
+    // Media Type Object lives at `….content.<media-type>`; its `examples`
+    // map is OpenAPI, not the `content` object itself.
+    if parent == "components" || parent.contains(".content.") {
+        return true;
+    }
+    // Parameter Object: `parameters`, `parameters[i]`, or
+    // `components.parameters.<name>`.
+    parent.split('.').any(|seg| seg == "parameters" || seg.starts_with("parameters["))
 }
 
 /// OpenAPI `examples` maps (media type, parameter, or `components.examples`)
@@ -3829,6 +3855,42 @@ mod tests {
         assert!(
             !messages.iter().any(|m| m.contains("payload-data")),
             "example value $ref is payload, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_literal_ref_in_extension_examples() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/echo": {
+                    "get": {
+                        "summary": "Echo",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "x-documentation": {
+                "examples": {
+                    "raw": { "$ref": "not-a-schema-pointer" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("unresolved local")
+                || f.message.contains("not-a-schema-pointer")),
+            "vendor-extension examples are payload, got: {findings:?}"
         );
     }
 
