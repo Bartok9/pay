@@ -901,8 +901,8 @@ fn collect_local_ref_findings(
                     format!("{location}.{key}")
                 };
                 // `example` is always a payload. `examples` is an OpenAPI
-                // map of Example Objects only at media type, parameter, or
-                // `components.examples`. JSON Schema `examples` is a value
+                // map of Example Objects at media type, parameter, header,
+                // or `components.examples`. JSON Schema `examples` is a value
                 // array. Vendor-extension `examples` is payload even when it
                 // is an object (`x-documentation.examples.raw`).
                 if key == "example" {
@@ -950,13 +950,14 @@ fn collect_local_ref_findings(
 /// OpenAPI map of Example Objects or Reference Objects, not payload.
 ///
 /// OpenAPI 3.0/3.1 put that map on a Media Type Object, a Parameter Object
-/// (`in` is required), and `components.examples`. A vendor extension such as
-/// `x-documentation.examples` is not one of those, even if its values look
-/// like `$ref`.
+/// (`in` is required), a Header Object, and `components.examples`. A vendor
+/// extension such as `x-documentation.examples` is not one of those, even if
+/// its values look like `$ref`.
 fn is_openapi_examples_map(parent: &str) -> bool {
-    // Vendor extensions (`x-…`) are payload, including nested `content` or
-    // `parameters` keys a provider may invent.
-    if parent.split('.').any(|seg| seg.starts_with("x-")) {
+    // Vendor extensions (`x-…`) are payload. Dotted media types such as
+    // `application/vnd.x-widget+json` contain a `.` that is not a location
+    // separator, so they must not be treated as an `x-` extension.
+    if location_segments(parent).any(|seg| seg.starts_with("x-")) {
         return false;
     }
     // Media Type Object lives at `….content.<media-type>`; its `examples`
@@ -964,9 +965,53 @@ fn is_openapi_examples_map(parent: &str) -> bool {
     if parent == "components" || parent.contains(".content.") {
         return true;
     }
-    // Parameter Object: `parameters`, `parameters[i]`, or
+    // Header Object: `headers`, `headers.<name>`, or `headers.<name>.schema`
+    // is not this map. Parameter Object: `parameters`, `parameters[i]`, or
     // `components.parameters.<name>`.
-    parent.split('.').any(|seg| seg == "parameters" || seg.starts_with("parameters["))
+    location_segments(parent).any(|seg| {
+        seg == "parameters"
+            || seg.starts_with("parameters[")
+            || seg == "headers"
+            || seg.starts_with("headers[")
+    })
+}
+
+/// Split a document location on `.` separators, keeping a media-type token
+/// (the segment after `content`) intact so `application/vnd.x-widget+json`
+/// is one segment.
+fn location_segments(location: &str) -> impl Iterator<Item = &str> {
+    let mut rest = location;
+    let mut pending_media = false;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        if pending_media {
+            pending_media = false;
+            let (media, after) = split_media_type(rest);
+            rest = after;
+            return Some(media);
+        }
+        let (seg, after) = rest.split_once('.').unwrap_or((rest, ""));
+        rest = after;
+        if seg == "content" {
+            pending_media = true;
+        }
+        Some(seg)
+    })
+}
+
+/// A media type runs until the next location key (`.examples`, `.schema`,
+/// `.example`, `.encoding`), not the next dot inside the type itself.
+fn split_media_type(rest: &str) -> (&str, &str) {
+    const TAILS: &[&str] = &[".examples", ".schema", ".example", ".encoding"];
+    let cut = TAILS
+        .iter()
+        .filter_map(|tail| rest.find(tail))
+        .min()
+        .unwrap_or(rest.len());
+    let (media, after) = rest.split_at(cut);
+    (media, after.strip_prefix('.').unwrap_or(after))
 }
 
 /// OpenAPI `examples` maps (media type, parameter, or `components.examples`)
@@ -3891,6 +3936,54 @@ mod tests {
             !findings.iter().any(|f| f.message.contains("unresolved local")
                 || f.message.contains("not-a-schema-pointer")),
             "vendor-extension examples are payload, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_unresolved_header_and_dotted_media_example_refs() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/widgets": {
+                    "get": {
+                        "summary": "List widgets",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "headers": {
+                                    "Rate-Limit": {
+                                        "schema": { "type": "integer" },
+                                        "examples": {
+                                            "sample": { "$ref": "#/components/examples/MissingHeader" }
+                                        }
+                                    }
+                                },
+                                "content": {
+                                    "application/vnd.x-widget+json": {
+                                        "schema": { "type": "object" },
+                                        "examples": {
+                                            "sample": { "$ref": "#/components/examples/MissingMedia" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let messages: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/MissingHeader")
+                && m.contains("responses.200.headers.Rate-Limit.examples.sample")),
+            "expected header example ref error, got: {findings:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/MissingMedia")
+                && m.contains("application/vnd.x-widget+json.examples.sample")),
+            "expected dotted media-type example ref error, got: {findings:?}"
         );
     }
 
