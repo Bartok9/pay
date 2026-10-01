@@ -13,10 +13,9 @@ import type {
     TokenBalance,
 } from '@solana/kit';
 import {
-    decompileTransactionMessage,
-    getBase64Codec,
-    getCompiledTransactionMessageCodec,
-    getTransactionCodec,
+    decodeTransactionFromRpcResponse,
+    getAccountMetasFromCompiledTransactionMessage,
+    getInstructionsFromCompiledTransactionMessage,
     MAX_SUPPORTED_TRANSACTION_VERSION,
 } from '@solana/kit';
 import { parseAddMemoInstruction } from '@solana-program/memo';
@@ -66,6 +65,10 @@ type TransactionMeta = {
     postBalances: readonly Lamports[];
     preTokenBalances?: readonly TokenBalance[];
     postTokenBalances?: readonly TokenBalance[];
+    loadedAddresses?: {
+        writable: readonly Address[];
+        readonly: readonly Address[];
+    };
 };
 
 function validateAmount(amount: number): void {
@@ -74,15 +77,25 @@ function validateAmount(amount: number): void {
     }
 }
 
-function parseBase64Transaction(b64TransactionResponse: Base64EncodedDataResponse) {
-    const [base64Transaction] = b64TransactionResponse;
-    const transactionBytes = getBase64Codec().encode(base64Transaction);
-    const transaction = getTransactionCodec().decode(transactionBytes);
-    const compiledMessage = getCompiledTransactionMessageCodec().decode(transaction.messageBytes);
-    const decompiledMessage = decompileTransactionMessage(compiledMessage);
-    const { staticAccounts } = compiledMessage;
-    const instructions = [...decompiledMessage.instructions];
-    return { instructions, staticAccounts };
+function parseTransaction(response: { transaction: Base64EncodedDataResponse; meta: TransactionMeta }) {
+    const { compiledMessage, loadedAddresses } = decodeTransactionFromRpcResponse(response);
+    if (compiledMessage.version === 0 && compiledMessage.addressTableLookups?.length) {
+        const lookups = compiledMessage.addressTableLookups;
+        if (
+            !response.meta.loadedAddresses ||
+            loadedAddresses.writable.length !==
+                lookups.reduce((total, lookup) => total + lookup.writableIndexes.length, 0) ||
+            loadedAddresses.readonly.length !==
+                lookups.reduce((total, lookup) => total + lookup.readonlyIndexes.length, 0)
+        ) {
+            throw new ValidateTransferError('missing or invalid loaded addresses');
+        }
+    }
+    const instructions = getInstructionsFromCompiledTransactionMessage(compiledMessage, loadedAddresses);
+    const accountKeys = getAccountMetasFromCompiledTransactionMessage(compiledMessage, loadedAddresses).map(
+        meta => meta.address,
+    );
+    return { instructions, accountKeys };
 }
 
 function getMeta(meta: TransactionMeta | null) {
@@ -135,15 +148,15 @@ export async function validateTransfer(
     if (!response) throw new ValidateTransferError('not found');
 
     const meta = getMeta(response.meta);
-    const { instructions, staticAccounts } = parseBase64Transaction(response.transaction);
+    const { instructions, accountKeys } = parseTransaction({ transaction: response.transaction, meta });
 
     // Transfer instruction must be the last instruction
     const instruction = instructions.pop();
     validateInstruction(instruction);
 
     const { pre, post, decimals } = splToken
-        ? await validateSPLTokenTransfer(instruction, staticAccounts, meta, recipient, splToken, refs)
-        : validateSystemTransfer(instruction, staticAccounts, meta, recipient, refs);
+        ? await validateSPLTokenTransfer(instruction, accountKeys, meta, recipient, splToken, refs)
+        : validateSystemTransfer(instruction, accountKeys, meta, recipient, refs);
 
     const expected = amountToBaseUnits(amount, decimals);
     if (post - pre < expected) throw new ValidateTransferError('amount not transferred');
@@ -188,7 +201,7 @@ function validateReferences(
 
 function validateSystemTransfer(
     instruction: DecompiledInstruction,
-    staticAccounts: readonly Address[],
+    accountKeys: readonly Address[],
     meta: TransactionMeta,
     recipient: Address,
     references?: Reference[],
@@ -207,7 +220,7 @@ function validateSystemTransfer(
 
     validateReferences(instruction, Object.keys(parsed.accounts).length, references);
 
-    const accountIndex = staticAccounts.indexOf(recipient);
+    const accountIndex = accountKeys.indexOf(recipient);
     if (accountIndex === -1) throw new ValidateTransferError('recipient not found');
 
     const pre = meta.preBalances[accountIndex];
@@ -218,7 +231,7 @@ function validateSystemTransfer(
 
 async function validateSPLTokenTransfer(
     instruction: DecompiledInstruction,
-    staticAccounts: readonly Address[],
+    accountKeys: readonly Address[],
     meta: TransactionMeta,
     recipient: Address,
     splToken: Address,
@@ -261,7 +274,7 @@ async function validateSPLTokenTransfer(
 
     validateReferences(instruction, requiredAccounts, references);
 
-    const accountIndex = staticAccounts.indexOf(recipientATA);
+    const accountIndex = accountKeys.indexOf(recipientATA);
     if (accountIndex === -1) throw new ValidateTransferError('recipient not found');
 
     const preBalance = meta.preTokenBalances?.find(x => x.accountIndex === accountIndex);
