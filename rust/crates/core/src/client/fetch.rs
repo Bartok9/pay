@@ -543,8 +543,10 @@ fn raw_to_outcome(raw: RawResponse) -> RunOutcome {
 
 /// Path, query, and fragment to append to `PAY_DEBUGGER_PROXY`.
 ///
-/// Does not panic on missing `://`. A host-only URL becomes `/`; a host with
-/// a query but no slash becomes `/?…` so the query is not dropped.
+/// Does not panic on missing `://`. A host-only URL becomes `/`. Authority
+/// ends at the first `/`, `?`, or `#`, so a query that itself contains `/`
+/// (for example `https://gw.example?next=/paid`) stays in the query as
+/// `/?next=/paid` instead of being treated as the path.
 fn debugger_proxy_path(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return if url.starts_with('/') {
@@ -554,16 +556,15 @@ fn debugger_proxy_path(url: &str) -> String {
         };
     };
     let after_scheme = &url[scheme_end + 3..];
-    if let Some(slash) = after_scheme.find('/') {
-        return after_scheme[slash..].to_string();
+    let auth_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let rest = &after_scheme[auth_end..];
+    if rest.is_empty() || rest.starts_with(['?', '#']) {
+        format!("/{rest}")
+    } else {
+        rest.to_string()
     }
-    if let Some(q) = after_scheme.find('?') {
-        return format!("/{}", &after_scheme[q..]);
-    }
-    if let Some(hash) = after_scheme.find('#') {
-        return format!("/{}", &after_scheme[hash..]);
-    }
-    "/".to_string()
 }
 
 fn fetch_raw_with_method(
@@ -663,6 +664,14 @@ mod debugger_proxy_path_tests {
         assert_eq!(debugger_proxy_path("http://127.0.0.1:1402/a/b"), "/a/b");
         assert_eq!(debugger_proxy_path("https://gw.example"), "/");
         assert_eq!(debugger_proxy_path("https://gw.example?x=1"), "/?x=1");
+        assert_eq!(
+            debugger_proxy_path("https://gw.example?next=/paid"),
+            "/?next=/paid"
+        );
+        assert_eq!(
+            debugger_proxy_path("https://gw.example#frag/ment"),
+            "/#frag/ment"
+        );
         assert_eq!(debugger_proxy_path("/already"), "/already");
     }
 }
