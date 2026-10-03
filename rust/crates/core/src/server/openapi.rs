@@ -903,11 +903,15 @@ fn filter_discovery(
 
 /// Strip upstream-auth metadata that doesn't apply to proxy callers. The
 /// proxy handles upstream credentials internally (Google OAuth2, API keys,
-/// etc.); leaving the auth schemes in the served doc misleads agents into
-/// attaching tokens that the proxy won't honor anyway. Removes:
+/// etc.); leaving named auth schemes in the served doc misleads agents into
+/// attaching tokens that the proxy won't honor anyway.
+///
+/// Removes:
 ///
 /// - `components.securitySchemes` (OpenAPI 3) — drops the bucket entirely.
-/// - `security:` arrays at the root and on every operation (OpenAPI 3).
+/// - named `security` requirements at the root and on every operation
+///   (OpenAPI 3). An empty `security: []` is the explicit no-auth marker
+///   and is kept; stripping it makes free routes look authenticated.
 /// - `auth:` block (Google Discovery) at the root.
 /// - `scopes:` array on every Discovery method, recursively through nested
 ///   resources.
