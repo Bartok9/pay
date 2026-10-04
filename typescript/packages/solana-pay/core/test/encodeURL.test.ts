@@ -32,6 +32,15 @@ describe('encodeURL', () => {
             expect(String(url)).toBe(`solana:${recipient}`);
         });
 
+        it('encodes at most nine fractional digits', () => {
+            const recipient = 'mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN';
+            const amount = 1.1234567894;
+
+            const url = encodeURL({ recipient, amount });
+
+            expect(String(url)).toBe(`solana:${recipient}?amount=1.123456789`);
+        });
+
         it('encodes a url with recipient and amount', () => {
             const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
             const amount = 1;

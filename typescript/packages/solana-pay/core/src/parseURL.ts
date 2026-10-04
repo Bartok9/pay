@@ -87,6 +87,9 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
     const amountParam = searchParams.get('amount');
     if (amountParam != null) {
         if (!/^\d+(\.\d+)?$/.test(amountParam)) throw new ParseURLError('amount invalid');
+        // Spec ceiling is SOL's 9 decimals. Mint-specific limits are checked later.
+        const fractional = amountParam.split('.')[1];
+        if (fractional != null && fractional.length > 9) throw new ParseURLError('amount invalid');
 
         amount = Number(amountParam);
         if (Number.isNaN(amount)) throw new ParseURLError('amount NaN');
