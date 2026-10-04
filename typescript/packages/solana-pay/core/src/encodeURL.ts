@@ -74,7 +74,7 @@ function encodeTransferRequestURL({
     const url = new URL(SOLANA_PROTOCOL + pathname);
 
     if (amount != null) {
-        url.searchParams.append('amount', amount.toFixed(10).replace(/0+$/, '').replace(/\.$/, ''));
+        url.searchParams.append('amount', amount.toFixed(9).replace(/0+$/, '').replace(/\.$/, ''));
     }
 
     if (splToken) {
