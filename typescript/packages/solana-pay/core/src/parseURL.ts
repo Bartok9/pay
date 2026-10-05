@@ -87,9 +87,13 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
     const amountParam = searchParams.get('amount');
     if (amountParam != null) {
         if (!/^\d+(\.\d+)?$/.test(amountParam)) throw new ParseURLError('amount invalid');
-        // Spec ceiling is SOL's 9 decimals. Mint-specific limits are checked later.
+        // SPEC.md: reject only when fractional digits exceed SOL (9) or that mint.
+        // Mint decimals are unknown here, so the 9-digit ceiling applies only to native SOL.
         const fractional = amountParam.split('.')[1];
-        if (fractional != null && fractional.length > 9) throw new ParseURLError('amount invalid');
+        const splTokenParam = searchParams.get('spl-token');
+        if (splTokenParam == null && fractional != null && fractional.length > 9) {
+            throw new ParseURLError('amount invalid');
+        }
 
         amount = Number(amountParam);
         if (Number.isNaN(amount)) throw new ParseURLError('amount NaN');
