@@ -39,6 +39,8 @@ describe('encodeURL', () => {
 
             expect(String(encodeURL({ recipient, memo: ok }))).toContain(`memo=${encodeURIComponent(ok)}`);
             expect(() => encodeURL({ recipient, memo: tooLong })).toThrow('memo invalid');
+            // 566 UTF-16 code units, 567 UTF-8 bytes — must not pass a character-count check
+            expect(() => encodeURL({ recipient, memo: 'a'.repeat(565) + 'é' })).toThrow('memo invalid');
         });
 
         it('encodes a url with recipient and amount', () => {
