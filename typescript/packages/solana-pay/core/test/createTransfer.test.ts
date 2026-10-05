@@ -197,6 +197,14 @@ describe('createTransfer', () => {
                     memo: 'a'.repeat(567),
                 }),
             ).rejects.toThrow('memo invalid');
+            // 566 UTF-16 code units, 567 UTF-8 bytes
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN,
+                    memo: 'a'.repeat(565) + 'é',
+                }),
+            ).rejects.toThrow('memo invalid');
         });
 
         it('should create SOL transfer with reference — reference has AccountRole.READONLY', async () => {
