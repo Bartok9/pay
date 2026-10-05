@@ -86,6 +86,14 @@ describe('parseURL', () => {
             },
         );
 
+        it('accepts a 10-decimal SPL amount (mint precision is checked later)', () => {
+            const recipient = 'mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN';
+            const splToken = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+            const url = `solana:${recipient}?amount=0.0000000001&spl-token=${splToken}`;
+
+            expect(parseURL(url).amount).toBe(0.0000000001);
+        });
+
         it('throws an error on invalid token', () => {
             const url = 'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=1&spl-token=0xffff';
 
