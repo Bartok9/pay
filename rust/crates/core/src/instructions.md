@@ -21,6 +21,8 @@ Never answer "Can pay do X" from memory; check `list_catalog`.
 - Top-up, deposit, add funds, or QR code for funding Pay: call `topup`; require
   the user to choose `mobile_wallet` or `onramp`, and require an onramp provider
   when using `onramp`.
+- Balance empty or too low for the task: explain the shortfall and offer
+  `topup` to deposit stablecoins.
 - Provider authoring or review: call `create_skill({content})`.
 
 Pay can cover paid APIs and catalog-backed workflows such as web search,
@@ -56,7 +58,8 @@ ad-hoc page scraping.
   user's limit: stop and explain.
 - Empty or stale provider results: retry once with `search_catalog({refresh:
   true})`; if still empty, ask before using a non-Pay fallback.
-- Missing stablecoin balance: call `get_balance()` and explain the shortfall.
+- Missing stablecoin balance: call `get_balance()`, explain the shortfall, and
+  offer `topup` to cover it.
 - 404 or unusable endpoint shape: try at most one documented fallback endpoint,
   then ask.
 - Async provider returns a token/job id: use the documented poll/retrieve

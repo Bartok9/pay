@@ -3,7 +3,7 @@
 //! Each tool's logic and params live in `tools/<name>.rs`.
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerConfig};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use std::sync::Arc;
@@ -12,7 +12,6 @@ use crate::context::{LocalContext, PayContext};
 use crate::tools;
 
 pub struct PayMcp {
-    #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
     session_cache: Arc<tools::curl::SessionCache>,
     context: Arc<dyn PayContext>,
@@ -31,14 +30,21 @@ impl PayMcp {
         Self::with_context(Arc::new(LocalContext::new()))
     }
 
-    /// A server whose calls are resolved by `context`; pay-connect's per-tenant
-    /// server.
+    /// A server whose calls are resolved by `context`, with local tools enabled.
+    /// Hosted deployments must use [`Self::with_hosted_context`].
     pub fn with_context(context: Arc<dyn PayContext>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             session_cache: Arc::new(tools::curl::SessionCache::default()),
             context,
         }
+    }
+
+    /// Hosted connectors cannot launch an inference worker on the user's machine.
+    pub fn with_hosted_context(context: Arc<dyn PayContext>) -> Self {
+        let mut server = Self::with_context(context);
+        server.tool_router.disable_route("sell_inference");
+        server
     }
 
     #[tool(
@@ -151,7 +157,7 @@ fees and setup costs. Use this to check available funds before making paid API c
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let scope = self.context.scope(&ctx)?;
-        tools::get_balance::run(params, &scope).await
+        tools::get_balance::run(params, &scope, self.tool_router.has_route("sell_inference")).await
     }
 
     #[tool(
@@ -172,6 +178,44 @@ a purchase; it only renders the QR PNG and returns the funding address.
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let scope = self.context.scope(&ctx)?;
         tools::topup::run(params, &scope).await
+    }
+
+    #[tool(description = r#"Earn stablecoins by selling this agent's inference.
+
+Creates a paid, OpenAI-compatible endpoint on pay-connect
+(`/endpoints/<id>/v1/chat/completions`) and starts a worker on this machine
+that answers each request with a local agent (claude, codex or goose) in the
+chosen directory. Buyers pay per request or per token in USDC, and the money
+lands in the active Pay account, so `get_balance` shows earnings as they
+settle. The endpoint stays up while the worker runs; stop it with
+`action: "stop"`.
+
+This is the counterpart of `topup`. When `get_balance` shows an empty or
+insufficient balance, present both options instead of assuming a deposit:
+"top up now" (`topup`), or "serve inference for a while to earn it"
+(`sell_inference`), typically priced below what the same model costs upstream
+so buyers come. Let the user choose; never create an endpoint without asking,
+since it publishes a URL and lets strangers run prompts through an agent on
+this machine. Every endpoint has an earn cap (at most $2): selling stops and
+the endpoint closes itself once that much has been earned. When the user has
+not named an amount, leave `earn_cap_usd` unset and the tool asks them through
+elicitation, which is also their consent to publish. The serving agent runs
+in an empty directory with tools refused, so buyers cannot reach the seller's
+files; `cwd` and `allow_tools` lift that and are spelled out in the
+elicitation. Pick a flat
+`price_per_request_usd` unless the user wants per-token pricing; a few cents
+per request earns a small budget in a few dozen requests.
+
+Actions: `create` (default), `status`, `reprice`, `stop`. Local `pay mcp`
+only: a hosted session has no machine to serve from.
+"#)]
+    async fn sell_inference(
+        &self,
+        Parameters(params): Parameters<tools::sell_inference::Params>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let scope = self.context.scope(&ctx)?;
+        tools::sell_inference::run(params, Some(ctx.peer), &scope).await
     }
 
     #[tool(description = r#"Create or validate a pay-skills provider listing.
@@ -199,17 +243,21 @@ For detailed authoring guidance, use the Pay skill reference
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for PayMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_server_info(
                 rmcp::model::Implementation::new("pay", env!("CARGO_PKG_VERSION"))
                     .with_title("Pay")
                     .with_website_url("https://pay.sh"),
             )
-            .with_instructions(pay_core::instructions::INSTRUCTIONS)
+            .with_instructions(if self.tool_router.has_route("sell_inference") {
+                pay_core::instructions::INSTRUCTIONS
+            } else {
+                pay_core::instructions::HOSTED_INSTRUCTIONS
+            })
     }
 }
 
@@ -238,6 +286,10 @@ mod tests {
         assert!(instructions.contains("Failure Recipes"));
         assert!(instructions.contains("402"));
         assert!(instructions.contains("Never answer \"Can pay do X\" from memory"));
+        assert!(
+            instructions.contains("sell_inference"),
+            "an empty balance has two answers"
+        );
     }
 
     #[test]
@@ -245,6 +297,32 @@ mod tests {
         let mcp = PayMcp::new();
         let info = mcp.get_info();
         assert_eq!(info.protocol_version, ProtocolVersion::V_2025_06_18);
+    }
+
+    #[test]
+    fn only_local_servers_expose_inference_selling() {
+        let local = PayMcp::new();
+        assert!(local.tool_router.has_route("sell_inference"));
+        let hosted = PayMcp::with_hosted_context(Arc::new(LocalContext::new()));
+        assert!(!hosted.tool_router.has_route("sell_inference"));
+        assert!(hosted.tool_router.is_disabled("sell_inference"));
+        assert!(
+            !hosted
+                .get_info()
+                .instructions
+                .unwrap()
+                .contains("sell_inference")
+        );
+        for tool in hosted.tool_router.list_all() {
+            assert_ne!(tool.name, "sell_inference");
+            assert!(
+                !tool
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("sell_inference")
+            );
+        }
     }
 
     #[test]
@@ -256,6 +334,9 @@ mod tests {
         assert!(source.contains("present the catalog grouped"));
         assert!(source.contains("Generate a top-up QR code PNG"));
         assert!(source.contains("must also specify the provider"));
+        assert!(source.contains("counterpart of `topup`"));
+        assert!(source.contains("never create an endpoint without asking"));
+        assert!(source.contains("earn cap"));
         assert!(source.contains("tie-breaker guidance"));
         assert!(source.contains("local wallet approval"));
         assert!(source.contains("does not need SOL for network fees"));

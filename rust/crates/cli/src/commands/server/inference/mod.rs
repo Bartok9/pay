@@ -237,6 +237,7 @@ impl PaymentState for InferenceState {
             status: exchange.status,
             ms: exchange.ms,
             req_headers: exchange.req_headers.into_iter().collect(),
+            req_body: None,
             res_headers: exchange.res_headers.into_iter().collect(),
             res_body: None,
             client_ip: exchange.client_ip,
@@ -386,6 +387,10 @@ fn usage_to_info(usage: &pay_core::InferenceUsage) -> InferenceInfo {
         streamed: usage.streamed,
         tokens_prompt: usage.tokens_prompt,
         tokens_completion: usage.tokens_completion,
+        tokens_cached: None,
+        tokens_reasoning: None,
+        response_id: None,
+        finish_reason: None,
         ttft_ms: usage.ttft_ms,
         tokens_per_sec: usage.tokens_per_sec,
     }
@@ -1320,7 +1325,12 @@ models:
                 .as_ref()
                 .and_then(|headers| headers.get("payment-response"))
                 .map(String::as_str),
-            Some("receipt-signature")
+            Some("[REDACTED]")
+        );
+        assert!(
+            !serde_json::to_string(&flows[0])
+                .unwrap()
+                .contains("receipt-signature")
         );
     }
 

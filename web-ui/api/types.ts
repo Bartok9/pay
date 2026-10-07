@@ -86,12 +86,34 @@ export interface ModelPricingSummary {
 export interface InferenceInfo {
   provider: string; // slug
   model?: string;
-  endpointKind?: "chat" | "completion" | "embeddings" | "other";
+  endpointKind?: "chat" | "completion" | "responses" | "embeddings" | "other";
   streamed: boolean;
   tokensPrompt?: number;
   tokensCompletion?: number;
+  tokensCached?: number;
+  tokensReasoning?: number;
+  responseId?: string;
+  finishReason?: string;
   ttftMs?: number;
   tokensPerSec?: number;
+}
+
+export interface PaymentDetails {
+  action?: string;
+  network?: string;
+  asset?: string;
+  channelId?: string;
+  recipient?: string;
+  depositAmount?: string;
+  authorizedAmount?: string;
+  voucherAmount?: string;
+  chargeAmount?: string;
+  channelBalance?: string;
+  chargedCumulativeAmount?: string;
+  totalClaimed?: string;
+  settlementAmount?: string;
+  settlementReference?: string;
+  receiptStatus?: string;
 }
 
 // ── Connection (inference mode grouping) ──
@@ -121,20 +143,24 @@ export interface PaymentFlow {
   // "exact"/"upto"/"batch-settlement" (x402). Rendered as "PROTOCOL:SCHEME".
   scheme?: string;
   resource: string; // URL path, e.g. "/mpp/quote/GOOG"
+  method?: string;
   status: FlowStatus;
   clientIp: string;
   startedAt: string; // ISO
   updatedAt: string; // ISO
   durationMs: number;
+  responseStatus?: number;
   amount?: string;
   payer?: string;
   session?: SessionInfo;
+  payment?: PaymentDetails;
   inference?: InferenceInfo;
   steps: FlowStep[];
   events: FlowEvent[];
   // Raw data for detail inspection
   challengeHeaders?: Record<string, string>;
   paymentHeaders?: Record<string, string>;
+  requestBody?: string | null;
   responseHeaders?: Record<string, string>;
   responseBody?: string | null;
 }

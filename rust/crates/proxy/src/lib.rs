@@ -77,6 +77,7 @@ fn run_inner<S: PaymentState>(
     threads: Option<usize>,
     tls: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
+    let resolver = deployment_policy_resolver(&state)?;
     // rustls 0.23 requires a process-default CryptoProvider. The dependency tree
     // enables BOTH ring (pingora) and aws-lc-rs (reqwest), so rustls can't pick
     // one automatically and pingora's TLS init panics. Install ring (what
@@ -86,7 +87,7 @@ fn run_inner<S: PaymentState>(
 
     let mut server = Server::new(None).map_err(|e| anyhow::anyhow!("pingora server: {e}"))?;
     server.bootstrap();
-    let gate = Http402Gate::new(state, control_plane);
+    let gate = Http402Gate::new(state, control_plane).with_deployment_policy_resolver(resolver);
     let mut svc = http_proxy_service(&server.configuration, gate);
     // Pingora services default to a single worker thread — match the core count
     // so it spreads across cores like the tokio proxy did.
@@ -132,11 +133,12 @@ pub fn run_with_shutdown<S: PaymentState>(
     threads: Option<usize>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let resolver = deployment_policy_resolver(&state)?;
     install_crypto_provider();
 
     let mut server = Server::new(None).map_err(|e| anyhow::anyhow!("pingora server: {e}"))?;
     server.bootstrap();
-    let gate = Http402Gate::new(state, control_plane);
+    let gate = Http402Gate::new(state, control_plane).with_deployment_policy_resolver(resolver);
     let mut svc = http_proxy_service(&server.configuration, gate);
     let cores = threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -167,6 +169,29 @@ pub fn run_with_shutdown<S: PaymentState>(
     Ok(())
 }
 
+/// Fail before binding the public listener, never silently use the static price.
+fn deployment_policy_resolver<S: PaymentState>(
+    state: &S,
+) -> anyhow::Result<
+    Option<std::sync::Arc<pay_core::server::deployment_policy::DeploymentPolicyResolver>>,
+> {
+    let resolver = pay_core::server::deployment_policy::DeploymentPolicyResolver::from_env()?;
+    if resolver.is_some() {
+        validate_deployment_sessions(&state.session_mpp_handles())?;
+    }
+    Ok(resolver.map(std::sync::Arc::new))
+}
+
+fn validate_deployment_sessions(
+    handles: &[std::sync::Arc<pay_core::server::session::SessionMpp>],
+) -> anyhow::Result<()> {
+    let [template] = handles else {
+        anyhow::bail!("deployment payment policies require exactly one session backend");
+    };
+    template.validate_deployment_template()?;
+    Ok(())
+}
+
 /// Pingora shutdown watcher driven by a caller-owned watch channel, with
 /// SIGTERM kept as a fallback so headless `kill` still works.
 #[cfg(unix)]
@@ -192,5 +217,23 @@ impl ShutdownSignalWatch for WatchShutdown {
                 _ = sigterm.recv() => return ShutdownSignal::GracefulTerminate,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod deployment_policy_config_tests {
+    use super::validate_deployment_sessions;
+    use pay_core::server::session::SessionMpp;
+    use pay_kit::mpp::server::session::SessionConfig;
+    use std::sync::Arc;
+
+    #[test]
+    fn deployment_mode_rejects_missing_duplicate_and_static_session_backends() {
+        let static_session = Arc::new(SessionMpp::new(SessionConfig::default(), "test-secret"));
+        assert!(validate_deployment_sessions(&[]).is_err());
+        assert!(validate_deployment_sessions(&[Arc::clone(&static_session)]).is_err());
+        assert!(
+            validate_deployment_sessions(&[Arc::clone(&static_session), static_session]).is_err()
+        );
     }
 }

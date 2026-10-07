@@ -254,7 +254,7 @@ pub fn select_challenge_by_balance<'a>(
         warn!(error = %e, "Could not auto-fund wallet via Surfpool before challenge selection");
     }
 
-    let balances = match rt.block_on(crate::client::balance::get_stablecoin_balances(
+    let balances = match rt.block_on(crate::client::balance::get_spendable_stablecoin_balances(
         &rpc_url, &pubkey,
     )) {
         Ok(balances) => balances,
@@ -353,7 +353,7 @@ pub fn choose_payment(
         warn!(error = %e, "Could not auto-fund wallet via Surfpool before payment selection");
     }
 
-    let balances = match rt.block_on(crate::client::balance::get_stablecoin_balances(
+    let balances = match rt.block_on(crate::client::balance::get_spendable_stablecoin_balances(
         &rpc_url, &pubkey,
     )) {
         Ok(balances) => balances,
@@ -831,6 +831,8 @@ mod tests {
                 "USDT",
             )],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -851,6 +853,8 @@ mod tests {
                 "USDG",
             )],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -891,6 +895,8 @@ mod tests {
                 ),
             ],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -927,6 +933,8 @@ mod tests {
                 ),
             ],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -950,6 +958,8 @@ mod tests {
                 "USDT",
             )],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };

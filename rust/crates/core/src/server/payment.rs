@@ -5,18 +5,29 @@
 //! - Payment header → verify with solana-mpp, then forward upstream
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http_body::Body as _;
 use pay_kit::mpp::AUTHORIZATION_HEADER;
 
 use crate::PaymentState;
+use crate::server::completion_stream::{self, DeliveryTask, StreamCompletion};
 use crate::server::metering::{self, RequestProperties};
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::telemetry;
 
-const MAX_DELEGATED_MODEL_HINT_BODY_BYTES: usize = 10 * 1024 * 1024;
+const MAX_METERED_MODEL_HINT_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Identity minted by the payment gate after caller-supplied internal headers
+/// have been discarded. Keeping it in request extensions prevents the generic
+/// proxy layer from having to trust values from the public header map.
+#[derive(Clone, Debug, Default)]
+pub struct TrustedPaymentIdentity {
+    pub payer: Option<String>,
+    pub channel_id: Option<String>,
+    pub original_host: Option<String>,
+}
 
 /// Axum middleware that gates metered endpoints behind MPP payment.
 pub async fn payment_middleware<S: PaymentState>(
@@ -39,10 +50,18 @@ pub async fn payment_middleware<S: PaymentState>(
 async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next) -> Response {
     use crate::server::gate::{GateDecision, GateRequest, PaymentGate};
 
+    let mut req = req;
+    // These headers are an internal trust boundary. Always discard caller
+    // values before payment evaluation; only a successfully verified MPP
+    // session may add them back below.
+    strip_internal_identity_headers(req.headers_mut());
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let path = uri.path().trim_start_matches('/').to_string();
+    let path = match crate::server::gate::gate_path(uri.path()) {
+        Ok(path) => path.to_string(),
+        Err(response) => return (response.status, response.body).into_response(),
+    };
 
     let str_header = |name: &str| {
         headers
@@ -95,27 +114,58 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             batch,
             paid_request,
         } => {
-            let mut req = req;
+            // Own durable cleanup before awaiting request preparation or the
+            // handler: cancellation while queued must also release the voucher.
+            let batch = batch.map(|forward| DeliveryTask::batch(state.clone(), *forward));
+            let mut upto = upto;
+            if let Some(plan) = upto
+                .as_mut()
+                .and_then(|forward| forward.settlement.as_mut())
+            {
+                let (restored, variant) = match prepare_upto_request_body(req, &path, plan).await {
+                    Ok(result) => result,
+                    Err(mut response) => {
+                        if let Some(forward) = upto.take()
+                            && let Some((name, value)) = crate::server::gate::settle_upto(
+                                &state,
+                                *forward.open,
+                                0,
+                                false,
+                                forward.telemetry,
+                            )
+                            .await
+                        {
+                            response.headers_mut().append(name, value);
+                        }
+                        return response;
+                    }
+                };
+                req = restored;
+                plan.variant_hint = variant;
+            }
             let mut delegated_session = None;
+            let mut verified_payer = None;
+            let mut verified_channel = None;
             if let Some(sf) = session {
                 let mut sf = *sf;
+                verified_payer = sf.verified_payer.clone();
+                verified_channel = Some(sf.channel_id.clone());
                 if sf.settlement.is_some() {
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
                     if sf
-                        .settlement
-                        .as_deref()
+                        .metered_plan()
                         .is_some_and(|plan| plan.variant_hint.is_none())
                     {
                         let force_stream_usage = path.ends_with("chat/completions");
                         let (restored, body_variant) =
-                            match prepare_delegated_request_body(req, force_stream_usage).await {
+                            match prepare_metered_request_body(req, force_stream_usage).await {
                                 Ok(result) => result,
                                 Err(response) => return response,
                             };
                         req = restored;
-                        if let Some(plan) = sf.settlement.as_deref_mut() {
+                        if let Some(plan) = sf.metered_plan_mut() {
                             plan.variant_hint = body_variant;
                         }
                     }
@@ -128,10 +178,33 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     ));
                 }
             }
-            let mut response = next.run(req).await;
-            if let Some(sf) = delegated_session {
-                response = settle_axum_delegated_response(sf, response).await;
-            }
+            req.extensions_mut().insert(TrustedPaymentIdentity {
+                payer: verified_payer,
+                channel_id: verified_channel,
+                original_host: host,
+            });
+            let deadline = delegated_session
+                .as_ref()
+                .and_then(|forward| forward.deadline());
+            let forwarding = async move {
+                if let Some(forward) = &delegated_session
+                    && forward.require_active().await.is_err()
+                {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                let response = next.run(req).await;
+                match delegated_session {
+                    Some(sf) => settle_axum_delegated_response(sf, response).await,
+                    None => response,
+                }
+            };
+            let mut response = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, forwarding).await {
+                    Ok(response) => response,
+                    Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
+                },
+                None => forwarding.await,
+            };
             // x402 `upto`: settle the opened channel *after* serving — debit the
             // metered amount on success, refund on failure.
             if let Some(uf) = upto {
@@ -218,42 +291,49 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             if let Some(bf) = batch {
                 let mut served_ok = response.status().is_success();
                 let mut cached = None;
-                if served_ok {
-                    let cacheable = response.body().size_hint().upper().is_some_and(|length| {
-                        length <= crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES as u64
-                    });
-                    if cacheable {
-                        let (mut parts, body) = response.into_parts();
-                        match axum::body::to_bytes(
-                            body,
-                            crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES,
-                        )
-                        .await
-                        {
-                            Ok(bytes) => {
-                                cached = Some(crate::server::gate::batch_cached_response(
-                                    parts.status,
-                                    &parts.headers,
-                                    &bytes,
-                                ));
-                                parts.headers.remove(header::CONTENT_LENGTH);
-                                response = Response::from_parts(parts, Body::from(bytes));
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "failed to buffer x402 batch response; releasing authorization"
-                                );
-                                served_ok = false;
-                                response = StatusCode::BAD_GATEWAY.into_response();
+                let completion = response.extensions().get::<StreamCompletion>().cloned();
+                if served_ok && let Some(completion) = completion {
+                    response = completion_stream::response(response, completion, bf, true);
+                } else {
+                    if served_ok {
+                        let cacheable = response.body().size_hint().upper().is_some_and(|length| {
+                            length <= crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES as u64
+                        });
+                        if cacheable {
+                            let (mut parts, body) = response.into_parts();
+                            match axum::body::to_bytes(
+                                body,
+                                crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES,
+                            )
+                            .await
+                            {
+                                Ok(bytes) => {
+                                    cached = Some(crate::server::gate::batch_cached_response(
+                                        parts.status,
+                                        &parts.headers,
+                                        &bytes,
+                                    ));
+                                    parts.headers.remove(header::CONTENT_LENGTH);
+                                    response = Response::from_parts(parts, Body::from(bytes));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "failed to buffer x402 batch response; releasing authorization"
+                                    );
+                                    served_ok = false;
+                                    response = StatusCode::BAD_GATEWAY.into_response();
+                                }
                             }
                         }
                     }
-                }
-                if let Some((n, v)) =
-                    crate::server::gate::settle_batch(&state, *bf, served_ok, cached).await
-                {
-                    response.headers_mut().append(n, v);
+                    match bf.finish(served_ok, cached).await {
+                        Ok(Some((n, v))) => {
+                            response.headers_mut().append(n, v);
+                        }
+                        Ok(None) => {}
+                        Err(_) => response = StatusCode::BAD_GATEWAY.into_response(),
+                    }
                 }
             }
             if let Some(ann) = receipt {
@@ -279,35 +359,113 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
     }
 }
 
-/// Read the model selected by OpenAI/Anthropic-compatible JSON requests and
-/// restore the body for the upstream handler. Native model routes already
-/// carry their variant in the path and never enter this path.
+pub fn strip_internal_identity_headers(headers: &mut HeaderMap) {
+    headers.remove("x-pay-verified-payer");
+    headers.remove("x-pay-verified-channel");
+    headers.remove("x-pay-original-host");
+    headers.remove("x-pay-gateway-host");
+    headers.remove("x-pay-wallet-resolver-proof");
+    headers.remove("x-pay-payment-policy");
+    headers.remove("x-pay-payment-policy-version");
+}
+
+/// Attach identity headers only after the payment gate has authenticated the
+/// payer. Both HTTP data planes share this helper so an upstream cannot observe
+/// caller-supplied identity at this internal trust boundary.
+pub fn inject_verified_payer_headers(
+    headers: &mut HeaderMap,
+    payer: &str,
+    original_host: Option<&str>,
+    channel_id: Option<&str>,
+) {
+    if let Ok(value) = HeaderValue::from_str(payer) {
+        headers.insert("x-pay-verified-payer", value);
+        if let Some(channel_id) = channel_id
+            && let Ok(value) = HeaderValue::from_str(channel_id)
+        {
+            headers.insert("x-pay-verified-channel", value);
+        }
+        if let Some(host) = original_host
+            && let Ok(value) = HeaderValue::from_str(host)
+        {
+            headers.insert("x-pay-original-host", value);
+        }
+    }
+}
+
+/// Preserve the request host selected by the trusted edge after caller-supplied
+/// internal headers have been removed. Resource routing needs this for every
+/// accepted payment scheme, including x402 requests that have no session payer.
+pub fn inject_original_host_header(headers: &mut HeaderMap, original_host: Option<&str>) {
+    if let Some(host) = original_host
+        && let Ok(value) = HeaderValue::from_str(host)
+    {
+        headers.insert("x-pay-original-host", value);
+    }
+}
+
+/// Only inference requests need body preparation; unrelated upto uploads keep
+/// their original streaming bodies and limits.
+#[allow(clippy::result_large_err)]
+async fn prepare_upto_request_body(
+    request: Request<Body>,
+    path: &str,
+    plan: &metering::UptoSettlementPlan,
+) -> Result<(Request<Body>, Option<String>), Response> {
+    let chat = path == "chat/completions" || path.ends_with("/chat/completions");
+    let json = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| {
+            let mime = mime.trim().to_ascii_lowercase();
+            mime == "application/json"
+                || (mime.starts_with("application/") && mime.ends_with("+json"))
+        });
+    let needs_model = plan.variant_hint.is_none()
+        && json
+        && plan
+            .metering
+            .variants
+            .iter()
+            .any(|variant| variant.param == "model");
+    // Non-model uploads must retain their streaming body and original limits.
+    // Outside the known chat API, require an explicit JSON content type rather
+    // than sniffing (and therefore consuming) an arbitrary request body.
+    if !chat && !needs_model {
+        return Ok((request, plan.variant_hint.clone()));
+    }
+    let (request, model) = prepare_metered_request_body(request, chat).await?;
+    Ok((request, plan.variant_hint.clone().or(model)))
+}
+
 // A direct `Response` error lets the middleware short-circuit without losing
 // status, headers, or body content produced while reading the request body.
 #[allow(clippy::result_large_err)]
-async fn prepare_delegated_request_body(
+async fn prepare_metered_request_body(
     request: Request<Body>,
     force_stream_usage: bool,
 ) -> Result<(Request<Body>, Option<String>), Response> {
     let (mut parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_DELEGATED_MODEL_HINT_BODY_BYTES)
+    let bytes = axum::body::to_bytes(body, MAX_METERED_MODEL_HINT_BODY_BYTES)
         .await
         .map_err(|error| {
-            tracing::warn!(%error, "failed to read delegated session request model");
+            tracing::warn!(%error, "failed to read metered request model");
             Response::builder()
                 .status(StatusCode::PAYLOAD_TOO_LARGE)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"error":"request_body_too_large"}"#))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         })?;
-    let (variant, bytes) = prepare_delegated_json_body(&bytes, force_stream_usage);
+    let (variant, bytes) = prepare_metered_json_body(&bytes, force_stream_usage);
     if force_stream_usage && let Ok(content_length) = bytes.len().to_string().parse() {
         parts.headers.insert(header::CONTENT_LENGTH, content_length);
     }
     Ok((Request::from_parts(parts, Body::from(bytes)), variant))
 }
 
-fn prepare_delegated_json_body(body: &[u8], force_stream_usage: bool) -> (Option<String>, Vec<u8>) {
+fn prepare_metered_json_body(body: &[u8], force_stream_usage: bool) -> (Option<String>, Vec<u8>) {
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) else {
         return (None, body.to_vec());
     };
@@ -345,14 +503,24 @@ fn prepare_delegated_json_body(body: &[u8], force_stream_usage: bool) -> (Option
     )
 }
 
-async fn settle_axum_delegated_response(
+pub(super) async fn settle_axum_delegated_response(
     forward: crate::server::gate::SessionForward,
     response: Response,
 ) -> Response {
-    if !response.status().is_success() {
+    if !response.status().is_success() && forward.deadline().is_none() {
         // Dropping `forward` releases the capacity lease without charging for
         // a response that was not successfully served.
         return response;
+    }
+
+    if forward.deadline().is_none()
+        && forward
+            .metered_plan()
+            .is_some_and(|plan| metering::flat_request_price(&plan.metering).is_some())
+        && let Some(completion) = response.extensions().get::<StreamCompletion>().cloned()
+    {
+        let delivery = DeliveryTask::session(forward, response.headers().clone());
+        return completion_stream::response(response, completion, delivery, false);
     }
 
     let is_sse = response
@@ -364,6 +532,13 @@ async fn settle_axum_delegated_response(
                 .split(';')
                 .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
         });
+    if crate::server::gate::is_streaming_response(response.headers())
+        && forward.deadline().is_some()
+    {
+        // Fixed deployment charging is atomic on a completed response. Do not
+        // release a partial stream that could later fail without being charged.
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
     if is_sse && session_stream::DelegatedSessionStreamMeter::supports(&forward) {
         let (mut parts, body) = response.into_parts();
         let meter = match session_stream::DelegatedSessionStreamMeter::from_forward(forward) {
@@ -389,8 +564,7 @@ async fn settle_axum_delegated_response(
     }
 
     let limit = forward
-        .settlement
-        .as_deref()
+        .metered_plan()
         .map(|plan| metering::upto_response_body_limit(&plan.metering))
         .unwrap_or(1024 * 1024);
     let (mut parts, body) = response.into_parts();
@@ -406,6 +580,10 @@ async fn settle_axum_delegated_response(
         }
     };
 
+    if !parts.status.is_success() {
+        parts.headers.remove(header::CONTENT_LENGTH);
+        return Response::from_parts(parts, Body::from(bytes));
+    }
     match crate::server::gate::settle_delegated_session(forward, &parts.headers, Some(&bytes)).await
     {
         Ok(receipt) => {
@@ -585,7 +763,9 @@ fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
 /// Whether `candidate` names the same token as `configured` on `network`:
 /// the same string, or a symbol and a mint address that resolve to one mint.
 pub fn same_currency(configured: &str, candidate: &str, network: &str) -> bool {
-    if configured.eq_ignore_ascii_case(candidate) {
+    // Token symbols are case-insensitive, but Solana base58 addresses are not.
+    // The resolver below normalizes known symbols while leaving addresses exact.
+    if configured == candidate {
         return true;
     }
     let network = Some(network);
@@ -657,6 +837,172 @@ mod tests {
     use super::*;
 
     const SPLIT_RECIPIENT: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+
+    #[test]
+    fn currency_symbols_normalize_but_mint_addresses_remain_case_sensitive() {
+        let usdc = pay_types::Stablecoin::Usdc.mint(Some("mainnet"));
+        assert!(same_currency("usdc", usdc, "mainnet"));
+        assert!(same_currency(usdc, usdc, "mainnet"));
+        let mut modified = usdc.as_bytes().to_vec();
+        let index = modified
+            .iter()
+            .position(u8::is_ascii_alphabetic)
+            .expect("USDC mint has letters");
+        modified[index] = if modified[index].is_ascii_uppercase() {
+            modified[index].to_ascii_lowercase()
+        } else {
+            modified[index].to_ascii_uppercase()
+        };
+        let other = String::from_utf8(modified).unwrap();
+        assert!(!same_currency(&other, usdc, "mainnet"));
+        assert!(!same_currency("USDC", &other, "mainnet"));
+    }
+
+    #[derive(Clone)]
+    struct PathTestState;
+
+    impl PaymentState for PathTestState {
+        fn apis(&self) -> &[pay_types::metering::ApiSpec] {
+            &[]
+        }
+
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn axum_rejects_ambiguous_paths_without_calling_upstream() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tower::ServiceExt;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let upstream_calls = calls.clone();
+        let app = axum::Router::new()
+            .fallback(move |uri: axum::http::Uri| {
+                upstream_calls.fetch_add(1, Ordering::SeqCst);
+                async move { uri.to_string() }
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                PathTestState,
+                payment_middleware::<PathTestState>,
+            ));
+        for path in ["//foo", "///foo?x=1", "//.well-known/test"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        for path in ["/foo", "/foo?x=%2F&x=2", "/foo//bar?x=1"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap(),
+                path
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn caller_cannot_forward_internal_policy_credentials() {
+        let mut headers = HeaderMap::new();
+        let internal = [
+            "x-pay-gateway-host",
+            "x-pay-wallet-resolver-proof",
+            "x-pay-payment-policy",
+            "x-pay-payment-policy-version",
+        ];
+        for name in internal {
+            headers.append(name, HeaderValue::from_static("attacker"));
+            headers.append(name, HeaderValue::from_static("second-value"));
+            assert!(crate::server::proxy::STRIP_HEADERS.contains(&name));
+        }
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+
+        strip_internal_identity_headers(&mut headers);
+
+        for name in internal {
+            assert!(!headers.contains_key(name));
+        }
+        assert_eq!(headers["accept"], "application/json");
+    }
+
+    #[test]
+    fn caller_cannot_spoof_internal_compute_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pay-verified-payer", HeaderValue::from_static("attacker"));
+        headers.insert(
+            "x-pay-verified-channel",
+            HeaderValue::from_static("attacker-channel"),
+        );
+        headers.insert(
+            "x-pay-original-host",
+            HeaderValue::from_static("attacker.example"),
+        );
+        headers.insert("host", HeaderValue::from_static("function.compute.example"));
+
+        strip_internal_identity_headers(&mut headers);
+
+        assert!(!headers.contains_key("x-pay-verified-payer"));
+        assert!(!headers.contains_key("x-pay-verified-channel"));
+        assert!(!headers.contains_key("x-pay-original-host"));
+        assert_eq!(headers.get("host").unwrap(), "function.compute.example");
+    }
+
+    #[test]
+    fn verified_compute_identity_is_injected_after_spoofed_values_are_removed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pay-verified-payer", HeaderValue::from_static("attacker"));
+        headers.insert(
+            "x-pay-original-host",
+            HeaderValue::from_static("attacker.example"),
+        );
+
+        strip_internal_identity_headers(&mut headers);
+        inject_verified_payer_headers(
+            &mut headers,
+            "verified-payer",
+            Some("hello.cpu.gcp.gateway-402.com"),
+            Some("verified-channel"),
+        );
+
+        assert_eq!(
+            headers.get("x-pay-verified-channel").unwrap(),
+            "verified-channel"
+        );
+        assert_eq!(
+            headers.get("x-pay-verified-payer").unwrap(),
+            "verified-payer"
+        );
+        assert_eq!(
+            headers.get("x-pay-original-host").unwrap(),
+            "hello.cpu.gcp.gateway-402.com"
+        );
+    }
+
+    #[test]
+    fn original_host_is_injected_without_a_session_payer() {
+        let mut headers = HeaderMap::new();
+        inject_original_host_header(&mut headers, Some("hello.cpu.gcp.gateway-402.com"));
+        assert_eq!(
+            headers.get("x-pay-original-host").unwrap(),
+            "hello.cpu.gcp.gateway-402.com"
+        );
+        assert!(!headers.contains_key("x-pay-verified-payer"));
+    }
 
     fn configured_charge_splits() -> (pay_types::metering::ApiSpec, pay_types::metering::Metering) {
         let spec: pay_types::metering::ProviderSpec = serde_yml::from_str(&format!(
@@ -812,10 +1158,169 @@ apis:
         assert_eq!(extract_variant_hint("v1/models"), None);
     }
 
+    #[tokio::test]
+    async fn upto_unrelated_uploads_are_not_polled_or_capped_by_model_preparation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        for (content_type, model_variant) in [
+            (Some("application/octet-stream"), false),
+            (Some("application/octet-stream"), true),
+            (Some("application/json"), false),
+            (None, true),
+        ] {
+            let mut plan = request_preparation_plan();
+            if model_variant {
+                plan.metering
+                    .variants
+                    .push(pay_types::metering::MeterVariant {
+                        param: "model".into(),
+                        value: "premium".into(),
+                        description: None,
+                        dimensions: plan.metering.dimensions.clone(),
+                    });
+            }
+            let polled = Arc::new(AtomicBool::new(false));
+            let observed = polled.clone();
+            let length = MAX_METERED_MODEL_HINT_BODY_BYTES + 1;
+            let body = Body::from_stream(futures_util::stream::once(async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(bytes::Bytes::from(vec![0xff; length]))
+            }));
+            let mut request = Request::builder()
+                .uri("/v1/uploads")
+                .header(header::CONTENT_LENGTH, length);
+            if let Some(content_type) = content_type {
+                request = request.header(header::CONTENT_TYPE, content_type);
+            }
+            let request = request.body(body).unwrap();
+            let (request, variant) = prepare_upto_request_body(request, "v1/uploads", &plan)
+                .await
+                .unwrap();
+            assert!(
+                !polled.load(Ordering::SeqCst),
+                "{content_type:?} model_variant={model_variant}"
+            );
+            assert_eq!(variant, None);
+            assert_eq!(
+                request.headers()[header::CONTENT_LENGTH],
+                length.to_string()
+            );
+            let bytes = axum::body::to_bytes(request.into_body(), length)
+                .await
+                .unwrap();
+            assert_eq!(bytes.len(), length);
+            assert!(bytes.iter().all(|byte| *byte == 0xff));
+        }
+    }
+
+    fn request_preparation_plan() -> metering::UptoSettlementPlan {
+        metering::UptoSettlementPlan {
+            metering: serde_json::from_value(serde_json::json!({
+                "dimensions": [{
+                    "direction": "output", "unit": "bytes", "scale": 1,
+                    "tiers": [{"price_usd": 0.000001}],
+                    "meter": {"source": "response_header", "header": "x-usage-bytes"}
+                }],
+                "upto": {"max_usd": 1.0}
+            }))
+            .unwrap(),
+            variant_hint: None,
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 1.0,
+            inferred_usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn upto_prepares_only_chat_or_declared_json_model_variants() {
+        let body = br#"{ "model": "premium", "stream": true }"#;
+        let mut plan = request_preparation_plan();
+        let request = || {
+            Request::builder()
+                .header(
+                    header::CONTENT_TYPE,
+                    "Application/Vnd.api+Json; charset=utf-8",
+                )
+                .body(Body::from(body.as_slice()))
+                .unwrap()
+        };
+        // JSON with no model variants must not be rewritten, even with stream=true.
+        let (untouched, model) = prepare_upto_request_body(request(), "v1/uploads", &plan)
+            .await
+            .unwrap();
+        assert_eq!(model, None);
+        assert_eq!(
+            axum::body::to_bytes(untouched.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            body
+        );
+
+        plan.metering
+            .variants
+            .push(pay_types::metering::MeterVariant {
+                param: "model".into(),
+                value: "premium".into(),
+                description: None,
+                dimensions: plan.metering.dimensions.clone(),
+            });
+        let (restored, model) = prepare_upto_request_body(request(), "v1/responses", &plan)
+            .await
+            .unwrap();
+        assert_eq!(model.as_deref(), Some("premium"));
+        assert_eq!(
+            axum::body::to_bytes(restored.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            body
+        );
+
+        // Chat must request usage even when the route already selected a model.
+        plan.variant_hint = Some("path-model".into());
+        let (restored, model) = prepare_upto_request_body(request(), "v1/chat/completions", &plan)
+            .await
+            .unwrap();
+        assert_eq!(model.as_deref(), Some("path-model"));
+        let body = axum::body::to_bytes(restored.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn metered_body_preserves_model_and_updates_length_for_stream_usage() {
+        let original = br#"{"model":"premium","stream":true,"messages":[]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, original.len())
+            .body(Body::from(original.as_slice()))
+            .unwrap();
+        let (request, variant) = prepare_metered_request_body(request, true).await.unwrap();
+        assert_eq!(variant.as_deref(), Some("premium"));
+        assert_eq!(request.uri().path(), "/v1/chat/completions");
+        let expected_length = request.headers()[header::CONTENT_LENGTH].clone();
+        let body = axum::body::to_bytes(request.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(expected_length, body.len().to_string());
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], "premium");
+        assert_eq!(json["messages"], serde_json::json!([]));
+        assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
     #[test]
     fn delegated_json_body_reads_openai_compatible_model() {
         assert_eq!(
-            prepare_delegated_json_body(br#"{"model":"qwen3.7-max","stream":true}"#, false).0,
+            prepare_metered_json_body(br#"{"model":"qwen3.7-max","stream":true}"#, false).0,
             Some("qwen3.7-max".to_string())
         );
     }
@@ -823,19 +1328,19 @@ apis:
     #[test]
     fn delegated_json_body_rejects_missing_or_invalid_models() {
         assert_eq!(
-            prepare_delegated_json_body(br#"{"stream":true}"#, false).0,
+            prepare_metered_json_body(br#"{"stream":true}"#, false).0,
             None
         );
         assert_eq!(
-            prepare_delegated_json_body(br#"{"model":"  "}"#, false).0,
+            prepare_metered_json_body(br#"{"model":"  "}"#, false).0,
             None
         );
-        assert_eq!(prepare_delegated_json_body(b"not json", false).0, None);
+        assert_eq!(prepare_metered_json_body(b"not json", false).0, None);
     }
 
     #[test]
     fn delegated_chat_stream_forces_provider_usage_frames() {
-        let (variant, body) = prepare_delegated_json_body(
+        let (variant, body) = prepare_metered_json_body(
             br#"{"model":"qwen3.7-plus","stream":true,"stream_options":{"include_usage":false}}"#,
             true,
         );
@@ -851,7 +1356,7 @@ apis:
     #[test]
     fn delegated_non_stream_request_body_is_unchanged() {
         let body = br#"{"model":"qwen3.7-plus","stream":false}"#;
-        let (_, prepared) = prepare_delegated_json_body(body, true);
+        let (_, prepared) = prepare_metered_json_body(body, true);
         assert_eq!(prepared, body);
     }
 

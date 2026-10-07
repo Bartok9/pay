@@ -2,10 +2,11 @@
 //!
 //! - SOL is fetched directly from a Solana JSON-RPC endpoint (`getBalance` /
 //!   `getMultipleAccounts`).
-//! - Token balances come from the **pay-api** stablecoin service
+//! - Token balances normally come from the **pay-api** stablecoin service
 //!   (`GET /v1/balance/stablecoins`). pay-api derives ATAs locally and does a
 //!   single `getMultipleAccounts` call against its own configured RPC, so we
 //!   pay one HTTP round trip here rather than scanning every token account.
+//!   A direct Solana RPC lookup across SPL Token and Token-2022 is the fallback.
 //!
 //! Environment variables:
 //! - `PAY_MAINNET_RPC_URL` — override the default Solana mainnet RPC.
@@ -13,7 +14,10 @@
 
 use pay_types::Stablecoin;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 /// Default pay-api host. Override with `PAY_API_URL`.
 pub const DEFAULT_PAY_API_URL: &str = "https://api.pay.sh";
@@ -91,6 +95,9 @@ pub struct AccountBalances {
     pub sol_lamports: u64,
     pub tokens: Vec<TokenBalance>,
     pub credits: Vec<CreditBalance>,
+    /// Still-committable escrow held in open payment channels, grouped by mint.
+    pub committable_channels: Vec<TokenBalance>,
+    pub channel_balances_unavailable: bool,
     /// True when pay-api returned token balances but could not determine
     /// program-backed credit balances.
     pub credits_unavailable: bool,
@@ -173,6 +180,10 @@ impl ReceivedFunds {
 struct ApiResponse {
     balances: Vec<ApiBalance>,
     #[serde(default)]
+    committable_channel_balances: Vec<ApiBalance>,
+    #[serde(default)]
+    channel_balances_unavailable: bool,
+    #[serde(default)]
     credits: std::collections::BTreeMap<String, ApiCredit>,
     #[serde(default)]
     credits_unavailable: bool,
@@ -201,6 +212,8 @@ struct ApiCredit {
 
 struct ApiBalances {
     tokens: Vec<TokenBalance>,
+    committable_channels: Vec<TokenBalance>,
+    channel_balances_unavailable: bool,
     credits: Vec<CreditBalance>,
     credits_unavailable: bool,
 }
@@ -240,6 +253,156 @@ async fn fetch_stablecoins_via_api(
     Ok(parse_api_balances(parsed))
 }
 
+/// Read supported stablecoins directly from Solana when pay-api is
+/// unavailable. Both token programs are queried because USDPT uses Token-2022
+/// while the other currently supported mainnet stablecoins use SPL Token.
+async fn fetch_stablecoins_via_rpc(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    pubkey: &str,
+    spendable_only: bool,
+) -> crate::Result<Vec<TokenBalance>> {
+    let mut responses = Vec::with_capacity(2);
+    for program_id in [TOKEN_PROGRAM, TOKEN_2022_PROGRAM] {
+        let mut response = rpc_call(
+            client,
+            rpc_url,
+            "getTokenAccountsByOwner",
+            serde_json::json!([
+                pubkey,
+                { "programId": program_id },
+                { "encoding": "jsonParsed", "commitment": "confirmed" }
+            ]),
+        )
+        .await?;
+        if spendable_only {
+            retain_associated_token_accounts(&mut response, pubkey, program_id)?;
+        }
+        responses.push(response);
+    }
+    Ok(parse_rpc_stablecoin_balances(&responses))
+}
+
+fn retain_associated_token_accounts(
+    response: &mut serde_json::Value,
+    owner: &str,
+    token_program: &str,
+) -> crate::Result<()> {
+    use solana_pubkey::Pubkey;
+    use std::str::FromStr;
+
+    let owner = Pubkey::from_str(owner).map_err(|e| crate::Error::Config(e.to_string()))?;
+    let token_program =
+        Pubkey::from_str(token_program).map_err(|e| crate::Error::Config(e.to_string()))?;
+    let associated_program = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+        .expect("associated token program is valid");
+    if let Some(accounts) = response["result"]["value"].as_array_mut() {
+        accounts.retain(|account| {
+            let Some(mint) = account["account"]["data"]["parsed"]["info"]["mint"]
+                .as_str()
+                .and_then(|mint| Pubkey::from_str(mint).ok())
+            else {
+                return false;
+            };
+            let (ata, _) = Pubkey::find_program_address(
+                &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+                &associated_program,
+            );
+            account["pubkey"].as_str() == Some(ata.to_string().as_str())
+        });
+    }
+    Ok(())
+}
+
+fn parse_rpc_stablecoin_balances(responses: &[serde_json::Value]) -> Vec<TokenBalance> {
+    let mut amounts = BTreeMap::<String, u64>::new();
+    for response in responses {
+        let Some(accounts) = response["result"]["value"].as_array() else {
+            continue;
+        };
+        for account in accounts {
+            let info = &account["account"]["data"]["parsed"]["info"];
+            let Some(mint) = info["mint"].as_str() else {
+                continue;
+            };
+            if Stablecoin::from_mint(mint).is_none() {
+                continue;
+            }
+            let Some(raw) = info["tokenAmount"]["amount"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            *amounts.entry(mint.to_string()).or_default() += raw;
+        }
+    }
+    amounts
+        .into_iter()
+        .filter(|(_, raw_amount)| *raw_amount > 0)
+        .map(|(mint, raw_amount)| {
+            let currency = Stablecoin::from_mint(&mint).expect("known mint was filtered above");
+            TokenBalance {
+                mint,
+                raw_amount,
+                ui_amount: raw_amount as f64 / 10_f64.powi(i32::from(currency.decimals())),
+                symbol: Some(currency.symbol().to_string()),
+            }
+        })
+        .collect()
+}
+
+async fn fetch_stablecoins_with_rpc_fallback(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    pubkey: &str,
+    spendable_only: bool,
+) -> (ApiBalances, bool) {
+    fetch_stablecoins_from_endpoints(client, &pay_api_url(), rpc_url, pubkey, spendable_only).await
+}
+
+async fn fetch_stablecoins_from_endpoints(
+    client: &reqwest::Client,
+    api_url: &str,
+    rpc_url: &str,
+    pubkey: &str,
+    spendable_only: bool,
+) -> (ApiBalances, bool) {
+    match fetch_stablecoins_via_api(client, api_url, pubkey, infer_network(rpc_url)).await {
+        Ok(balances) => (balances, false),
+        Err(api_error) => {
+            match fetch_stablecoins_via_rpc(client, rpc_url, pubkey, spendable_only).await {
+                Ok(tokens) => {
+                    tracing::debug!(error = %api_error, "pay-api unreachable; used direct RPC stablecoin fallback");
+                    (
+                        ApiBalances {
+                            tokens,
+                            committable_channels: Vec::new(),
+                            channel_balances_unavailable: true,
+                            credits: Vec::new(),
+                            credits_unavailable: true,
+                        },
+                        false,
+                    )
+                }
+                Err(rpc_error) => {
+                    tracing::debug!(%api_error, %rpc_error, "stablecoin balance lookup unavailable from pay-api and RPC");
+                    (
+                        ApiBalances {
+                            tokens: Vec::new(),
+                            committable_channels: Vec::new(),
+                            channel_balances_unavailable: true,
+                            credits: Vec::new(),
+                            credits_unavailable: true,
+                        },
+                        true,
+                    )
+                }
+            }
+        }
+    }
+}
+
 fn parse_api_balances(parsed: ApiResponse) -> ApiBalances {
     let tokens = parsed
         .balances
@@ -265,6 +428,11 @@ fn parse_api_balances(parsed: ApiResponse) -> ApiBalances {
             })
         })
         .collect();
+    let committable_channels = parsed
+        .committable_channel_balances
+        .into_iter()
+        .filter_map(api_token_balance)
+        .collect();
     let credits = parsed
         .credits
         .into_iter()
@@ -284,9 +452,28 @@ fn parse_api_balances(parsed: ApiResponse) -> ApiBalances {
         .collect();
     ApiBalances {
         tokens,
+        committable_channels,
+        channel_balances_unavailable: parsed.channel_balances_unavailable,
         credits,
         credits_unavailable: parsed.credits_unavailable,
     }
+}
+
+fn api_token_balance(balance: ApiBalance) -> Option<TokenBalance> {
+    let raw_amount = balance.raw_amount.parse().ok()?;
+    if raw_amount == 0 {
+        return None;
+    }
+    let symbol = balance
+        .symbol
+        .filter(|symbol| !symbol.trim().is_empty())
+        .or_else(|| mint_symbol(&balance.mint).map(str::to_string));
+    Some(TokenBalance {
+        mint: balance.mint,
+        raw_amount,
+        ui_amount: balance.ui_amount,
+        symbol,
+    })
 }
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -320,63 +507,56 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
     let sol_lamports = sol_resp["result"]["value"].as_u64().unwrap_or(0);
 
     let (api_balances, tokens_unavailable) =
-        match fetch_stablecoins_via_api(&client, &pay_api_url(), pubkey, infer_network(rpc_url))
-            .await
-        {
-            Ok(balances) => (balances, false),
-            Err(e) => {
-                tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
-                (
-                    ApiBalances {
-                        tokens: Vec::new(),
-                        credits: Vec::new(),
-                        credits_unavailable: true,
-                    },
-                    true,
-                )
-            }
-        };
+        fetch_stablecoins_with_rpc_fallback(&client, rpc_url, pubkey, false).await;
 
     Ok(AccountBalances {
         sol_lamports,
         tokens: api_balances.tokens,
         credits: api_balances.credits,
+        committable_channels: api_balances.committable_channels,
+        channel_balances_unavailable: api_balances.channel_balances_unavailable,
         credits_unavailable: api_balances.credits_unavailable,
         tokens_unavailable,
     })
 }
 
-/// Fetch only stablecoin balances via pay-api.
+/// Fetch stablecoin holdings via pay-api, with an owner-account RPC fallback.
 ///
-/// This is used by top-up flows where SOL transfers are intentionally ignored
-/// and startup should not pay for an extra direct Solana RPC round trip.
+/// This skips the SOL lookup. The fallback includes custom token accounts for
+/// display; payment selection must use [`get_spendable_stablecoin_balances`].
 pub async fn get_stablecoin_balances(
     rpc_url: &str,
     pubkey: &str,
 ) -> crate::Result<AccountBalances> {
+    stablecoin_balances(rpc_url, pubkey, false).await
+}
+
+/// Fetch balances available to payment builders, which debit associated token accounts.
+///
+/// pay-api already returns ATA balances. Unlike display balances, the RPC
+/// fallback excludes custom token accounts for both SPL Token and Token-2022.
+pub async fn get_spendable_stablecoin_balances(
+    rpc_url: &str,
+    pubkey: &str,
+) -> crate::Result<AccountBalances> {
+    stablecoin_balances(rpc_url, pubkey, true).await
+}
+
+async fn stablecoin_balances(
+    rpc_url: &str,
+    pubkey: &str,
+    spendable_only: bool,
+) -> crate::Result<AccountBalances> {
     let client = balance_client()?;
     let (api_balances, tokens_unavailable) =
-        match fetch_stablecoins_via_api(&client, &pay_api_url(), pubkey, infer_network(rpc_url))
-            .await
-        {
-            Ok(balances) => (balances, false),
-            Err(e) => {
-                tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
-                (
-                    ApiBalances {
-                        tokens: Vec::new(),
-                        credits: Vec::new(),
-                        credits_unavailable: true,
-                    },
-                    true,
-                )
-            }
-        };
+        fetch_stablecoins_with_rpc_fallback(&client, rpc_url, pubkey, spendable_only).await;
 
     Ok(AccountBalances {
         sol_lamports: 0,
         tokens: api_balances.tokens,
         credits: api_balances.credits,
+        committable_channels: api_balances.committable_channels,
+        channel_balances_unavailable: api_balances.channel_balances_unavailable,
         credits_unavailable: api_balances.credits_unavailable,
         tokens_unavailable,
     })
@@ -468,12 +648,22 @@ async fn fetch_stablecoin_balances_batch_into(
     pubkeys: &[String],
     balances: &mut HashMap<String, AccountBalances>,
 ) {
-    let api = pay_api_url();
+    fetch_stablecoin_balances_batch_from_api(client, &pay_api_url(), rpc_url, pubkeys, balances)
+        .await;
+}
+
+async fn fetch_stablecoin_balances_batch_from_api(
+    client: &reqwest::Client,
+    api: &str,
+    rpc_url: &str,
+    pubkeys: &[String],
+    balances: &mut HashMap<String, AccountBalances>,
+) {
     let network = infer_network(rpc_url);
     let mut set = tokio::task::JoinSet::new();
     for pk in pubkeys {
         let client = client.clone();
-        let api = api.clone();
+        let api = api.to_string();
         let pk = pk.clone();
         set.spawn(async move {
             (
@@ -488,6 +678,8 @@ async fn fetch_stablecoin_balances_batch_into(
             Ok(api_balances) => {
                 if let Some(entry) = balances.get_mut(&pk) {
                     entry.tokens = api_balances.tokens;
+                    entry.committable_channels = api_balances.committable_channels;
+                    entry.channel_balances_unavailable = api_balances.channel_balances_unavailable;
                     entry.credits = api_balances.credits;
                     entry.credits_unavailable = api_balances.credits_unavailable;
                 }
@@ -497,6 +689,7 @@ async fn fetch_stablecoin_balances_batch_into(
                 if let Some(entry) = balances.get_mut(&pk) {
                     entry.tokens_unavailable = true;
                     entry.credits_unavailable = true;
+                    entry.channel_balances_unavailable = true;
                 }
             }
         }
@@ -542,6 +735,146 @@ async fn rpc_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn http_fixture(
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for (status, response) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = response.to_string();
+                let reply = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn batch_api_preserves_channel_balances_and_availability() {
+        let response = serde_json::json!({
+            "balances": [],
+            "committable_channel_balances": [{
+                "mint": Stablecoin::Usdc.mint(None).to_string(),
+                "raw_amount": "700", "ui_amount": 0.0007, "symbol": "USDC"
+            }],
+            "channel_balances_unavailable": true
+        });
+        let (api, task) = http_fixture(vec![
+            (200, response.clone()),
+            (200, response),
+            (503, serde_json::json!({})),
+        ])
+        .await;
+        let client = balance_client().unwrap();
+        let single = fetch_stablecoins_via_api(&client, &api, "payer", "mainnet")
+            .await
+            .unwrap();
+        let keys = vec!["payer".to_string()];
+        let mut batch = HashMap::from([("payer".to_string(), AccountBalances::default())]);
+        fetch_stablecoin_balances_batch_from_api(&client, &api, "mainnet", &keys, &mut batch).await;
+        assert_eq!(single.committable_channels.len(), 1);
+        assert_eq!(
+            batch["payer"].committable_channels[0].raw_amount,
+            single.committable_channels[0].raw_amount
+        );
+        assert_eq!(
+            batch["payer"].channel_balances_unavailable,
+            single.channel_balances_unavailable
+        );
+        let mut failed = HashMap::from([("payer".to_string(), AccountBalances::default())]);
+        fetch_stablecoin_balances_batch_from_api(&client, &api, "mainnet", &keys, &mut failed)
+            .await;
+        assert!(failed["payer"].channel_balances_unavailable);
+        assert!(failed["payer"].tokens_unavailable);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_fallback_keeps_custom_holdings_for_display_but_not_funding() {
+        use solana_pubkey::Pubkey;
+        use std::str::FromStr;
+        let owner = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+        let associated_program =
+            Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap();
+        let account = |currency: Stablecoin, raw: &str, custom: bool| {
+            let mint = currency.mint(None).to_string();
+            let mint_key = Pubkey::from_str(&mint).unwrap();
+            let ata = Pubkey::find_program_address(
+                &[owner.as_ref(), token_program.as_ref(), mint_key.as_ref()],
+                &associated_program,
+            )
+            .0;
+            serde_json::json!({
+                "pubkey": if custom { Pubkey::new_unique().to_string() } else { ata.to_string() },
+                "account": {"data": {"parsed": {"info": {"mint": mint, "tokenAmount": {"amount": raw}}}}}
+            })
+        };
+        let tokens = serde_json::json!({"result": {"value": [
+            account(Stablecoin::Usdc, "10000000", true),
+            account(Stablecoin::Usdc, "0", false),
+            account(Stablecoin::Usdt, "2000000", false)
+        ]}});
+        let empty = serde_json::json!({"result": {"value": []}});
+        let (api, api_task) = http_fixture(vec![(503, serde_json::json!({})); 2]).await;
+        let (rpc, rpc_task) = http_fixture(vec![
+            (200, tokens.clone()),
+            (200, empty.clone()),
+            (200, tokens),
+            (200, empty),
+        ])
+        .await;
+        let client = balance_client().unwrap();
+        let (display, unavailable) =
+            fetch_stablecoins_from_endpoints(&client, &api, &rpc, &owner.to_string(), false).await;
+        assert!(!unavailable);
+        assert_eq!(display.tokens.len(), 2);
+        assert_eq!(
+            display
+                .tokens
+                .iter()
+                .find(|t| t.is_symbol("USDC"))
+                .unwrap()
+                .raw_amount,
+            10_000_000
+        );
+        let (funding, unavailable) =
+            fetch_stablecoins_from_endpoints(&client, &api, &rpc, &owner.to_string(), true).await;
+        assert!(!unavailable);
+        assert_eq!(funding.tokens.len(), 1);
+        assert!(funding.tokens[0].is_symbol("USDT"));
+        assert_eq!(funding.tokens[0].raw_amount, 2_000_000);
+        api_task.await.unwrap();
+        rpc_task.await.unwrap();
+    }
 
     #[test]
     fn mint_symbol_usdc() {
@@ -655,6 +988,38 @@ mod tests {
     }
 
     #[test]
+    fn rpc_fallback_aggregates_known_stablecoins_and_ignores_unknown_tokens() {
+        let response = serde_json::json!({
+            "result": { "value": [
+                {
+                    "account": { "data": { "parsed": { "info": {
+                        "mint": pay_types::stablecoin_mints::USDC_MAINNET,
+                        "tokenAmount": { "amount": "46072908" }
+                    }}}}
+                },
+                {
+                    "account": { "data": { "parsed": { "info": {
+                        "mint": pay_types::stablecoin_mints::USDC_MAINNET,
+                        "tokenAmount": { "amount": "1000000" }
+                    }}}}
+                },
+                {
+                    "account": { "data": { "parsed": { "info": {
+                        "mint": "UnknownMint1111111111111111111111111111111",
+                        "tokenAmount": { "amount": "999999999" }
+                    }}}}
+                }
+            ]}
+        });
+
+        let balances = parse_rpc_stablecoin_balances(&[response]);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].symbol.as_deref(), Some("USDC"));
+        assert_eq!(balances[0].raw_amount, 47_072_908);
+        assert!((balances[0].ui_amount - 47.072_908).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn received_funds_has_any_sol() {
         let r = ReceivedFunds {
             sol_lamports: 100,
@@ -691,6 +1056,8 @@ mod tests {
             sol_lamports: 1_000_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -698,6 +1065,8 @@ mod tests {
             sol_lamports: 2_000_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -712,6 +1081,8 @@ mod tests {
             sol_lamports: 2_000_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -719,6 +1090,8 @@ mod tests {
             sol_lamports: 1_000_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -737,6 +1110,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -749,6 +1124,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -764,6 +1141,8 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -776,6 +1155,8 @@ mod tests {
                 symbol: None,
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -795,6 +1176,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -812,6 +1195,8 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: true,
         };
@@ -824,6 +1209,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -844,6 +1231,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -851,6 +1240,8 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: true,
         };
@@ -866,6 +1257,8 @@ mod tests {
             sol_lamports: 100,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: true,
         };
@@ -873,6 +1266,8 @@ mod tests {
             sol_lamports: 1_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: true,
         };

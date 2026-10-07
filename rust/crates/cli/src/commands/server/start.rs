@@ -121,15 +121,65 @@ async fn channel_store(
     }
 }
 
-async fn session_channel_store()
--> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
-    channel_store(
-        &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"],
-        &["PAY_MPP_REDIS_PREFIX", "PAY_SESSION_REDIS_PREFIX"],
-        "pay:session:v1:",
-        "MPP sessions",
-    )
-    .await
+enum ConfiguredSessionStore {
+    Static {
+        store: Arc<dyn pay_kit::mpp::store::ChannelStore>,
+        durable: bool,
+    },
+    Deployment(pay_core::server::session::DeploymentSessionStore),
+}
+
+impl ConfiguredSessionStore {
+    fn session(
+        &self,
+        config: pay_kit::mpp::server::session::SessionConfig,
+        secret: &str,
+    ) -> pay_core::Result<SessionMpp> {
+        match self {
+            Self::Static { store, .. } => Ok(SessionMpp::new_with_channel_store(
+                config,
+                secret,
+                Arc::clone(store),
+            )),
+            Self::Deployment(store) => SessionMpp::new_for_deployment(config, secret, store),
+        }
+    }
+
+    fn reconciliation(&self) -> SessionLifecycleReconciliation {
+        match self {
+            Self::Static { durable, .. } => session_lifecycle_reconciliation(*durable),
+            Self::Deployment(_) => SessionLifecycleReconciliation::External,
+        }
+    }
+}
+
+async fn session_channel_store(
+    deployment_policy_mode: bool,
+) -> pay_core::Result<ConfiguredSessionStore> {
+    const URLS: &[&str] = &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+    const PREFIXES: &[&str] = &["PAY_MPP_REDIS_PREFIX", "PAY_SESSION_REDIS_PREFIX"];
+    const PREFIX: &str = "pay:session:v1:";
+    if deployment_policy_mode {
+        let read = |names: &[&str]| -> pay_core::Result<Option<String>> {
+            for name in names {
+                match std::env::var(name) {
+                    Ok(value) if !value.trim().is_empty() => return Ok(Some(value.trim().into())),
+                    Ok(_) | Err(std::env::VarError::NotPresent) => {}
+                    Err(_) => return Err(pay_core::Error::Config(format!("invalid {name}"))),
+                }
+            }
+            Ok(None)
+        };
+        let url = read(URLS)?;
+        let prefix = read(PREFIXES)?.unwrap_or_else(|| PREFIX.into());
+        let store =
+            pay_core::server::session::DeploymentSessionStore::connect(url.as_deref(), &prefix)
+                .await?;
+        Ok(ConfiguredSessionStore::Deployment(store))
+    } else {
+        let (store, durable) = channel_store(URLS, PREFIXES, PREFIX, "MPP sessions").await?;
+        Ok(ConfiguredSessionStore::Static { store, durable })
+    }
 }
 
 async fn subscription_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
@@ -941,6 +991,7 @@ impl PaymentState for AppState {
             status: exchange.status,
             ms: exchange.ms,
             req_headers: exchange.req_headers.into_iter().collect(),
+            req_body: None,
             res_headers: exchange.res_headers.into_iter().collect(),
             res_body: None,
             client_ip: exchange.client_ip,
@@ -1157,44 +1208,13 @@ fn resolve_session_splits(
     Ok(splits)
 }
 
+/// See [`pay_core::server::session::delegated_session_channel_payout`].
 fn delegated_session_channel_payout(
     recipient: &str,
     operator: &str,
-    mut splits: Vec<pay_kit::mpp::server::session::Split>,
+    splits: Vec<pay_kit::mpp::server::session::Split>,
 ) -> pay_core::Result<(String, Vec<pay_kit::mpp::server::session::Split>)> {
-    if recipient == operator {
-        return Ok((recipient.to_string(), splits));
-    }
-
-    let recipient = solana_pubkey::Pubkey::from_str(recipient).map_err(|e| {
-        pay_core::Error::Config(format!(
-            "delegated session recipient is not a valid Solana pubkey: {e}"
-        ))
-    })?;
-    let explicit_bps = splits
-        .iter()
-        .try_fold(0_u16, |total, split| total.checked_add(split.bps))
-        .ok_or_else(|| {
-            pay_core::Error::Config("delegated session split basis points overflow".to_string())
-        })?;
-    let primary_bps = 10_000_u16.checked_sub(explicit_bps).ok_or_else(|| {
-        pay_core::Error::Config("delegated session splits exceed 100%".to_string())
-    })?;
-
-    if let Some(existing) = splits.iter_mut().find(|split| split.recipient == recipient) {
-        existing.bps = existing.bps.checked_add(primary_bps).ok_or_else(|| {
-            pay_core::Error::Config(
-                "delegated session recipient split basis points overflow".to_string(),
-            )
-        })?;
-    } else {
-        splits.push(pay_kit::mpp::server::session::Split {
-            recipient,
-            bps: primary_bps,
-        });
-    }
-
-    Ok((operator.to_string(), splits))
+    pay_core::server::session::delegated_session_channel_payout(recipient, operator, splits)
 }
 
 fn account_env_var(account: &str) -> Option<&str> {
@@ -1420,6 +1440,19 @@ impl StartCommand {
         apply_spec_env_vars(&api)?;
         api.resolve_env_templates()
             .map_err(pay_core::Error::Config)?;
+
+        // Select the trusted constructor only after complete resolver config
+        // validation. Pingora also validates the finished session template
+        // before binding its public listener.
+        let deployment_policy_mode =
+            pay_core::server::deployment_policy::DeploymentPolicyResolver::from_env()
+                .map_err(|error| pay_core::Error::Config(error.to_string()))?
+                .is_some();
+        if deployment_policy_mode && api.session.is_none() {
+            return Err(pay_core::Error::Config(
+                "deployment payment policies require session configuration".into(),
+            ));
+        }
 
         // Resolve per-endpoint `schemes` defaults once, before the gate, the
         // OpenAPI builder, and the x402-backend probe read them — a session
@@ -1819,6 +1852,20 @@ impl StartCommand {
                     &currency_configs,
                     &session_benchmark_test_mints,
                 )?;
+                if deployment_policy_mode
+                    && (currency_configs.len() != 1
+                        || currency_configs[0].2 != 6
+                        || !pay_core::server::payment::same_currency(
+                            &currency_configs[0].1,
+                            pay_types::Stablecoin::Usdc.mint(Some(network.slug())),
+                            network.slug(),
+                        ))
+                {
+                    return Err(pay_core::Error::Config(
+                        "deployment sessions require exactly one network-matched USDC currency"
+                            .into(),
+                    ));
+                }
                 let session_token_programs = resolve_session_currency_token_programs(
                     &currency_configs,
                     &session_benchmark_test_mints,
@@ -1836,6 +1883,14 @@ impl StartCommand {
                     ConfigVoucherSigner::Client => VoucherSigner::Client,
                     ConfigVoucherSigner::Operator => VoucherSigner::Operator,
                 };
+                if deployment_policy_mode
+                    && (voucher_signer != VoucherSigner::Operator || sess.reuse_from_chain)
+                {
+                    return Err(pay_core::Error::Config(
+                        "deployment sessions require operator vouchers and disabled chain adoption"
+                            .into(),
+                    ));
+                }
                 if voucher_signer == VoucherSigner::Operator && fee_payer_signer.is_none() {
                     return Err(pay_core::Error::Config(
                         "operator-signed sessions require operator.fee_payer so the gateway can sign metered vouchers".to_string(),
@@ -1881,8 +1936,7 @@ impl StartCommand {
                     ));
                 }
 
-                let (session_channel_store, durable_session_store) =
-                    session_channel_store().await?;
+                let session_channel_store = session_channel_store(deployment_policy_mode).await?;
                 let mut session_mpps = Vec::with_capacity(currency_configs.len());
                 for ((_, session_mpp_currency, session_decimals), token_program) in
                     currency_configs.iter().zip(session_token_programs)
@@ -1918,11 +1972,7 @@ impl StartCommand {
                         token_program: Some(token_program),
                     };
 
-                    let mut smpp = SessionMpp::new_with_channel_store(
-                        config,
-                        session_secret.clone(),
-                        Arc::clone(&session_channel_store),
-                    )
+                    let mut smpp = session_channel_store.session(config, &session_secret)?
                         .with_realm(api.title.clone())
                         .with_blockhash_cache(blockhash_cache.clone())
                         .with_reuse_from_chain(sess.reuse_from_chain);
@@ -1935,7 +1985,7 @@ impl StartCommand {
                         Duration::from_millis(sess.close_delay_ms),
                         Duration::from_millis(sess.close_batch_interval_ms),
                         Duration::from_millis(sess.settlement_interval_ms),
-                        session_lifecycle_reconciliation(durable_session_store),
+                        session_channel_store.reconciliation(),
                     );
                     session_mpps.push(smpp);
                 }
@@ -2627,16 +2677,21 @@ impl StartCommand {
                             .extensions
                             .get::<pay_core::server::session_stream::SessionStreamContext>()
                             .cloned();
+                        let trusted_identity = parts
+                            .extensions
+                            .get::<pay_core::server::payment::TrustedPaymentIdentity>()
+                            .cloned();
                         let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
                             .await
                             .unwrap_or_default();
-                        pay_core::server::proxy::forward_request_with_session_metering(
+                        pay_core::server::proxy::forward_request_with_session_metering_and_identity(
                             &api,
                             parts.method,
                             &parts.uri,
                             &parts.headers,
                             bytes,
                             session_context,
+                            trusted_identity.as_ref(),
                         )
                         .await
                         .unwrap_or_else(|e| e)
@@ -3858,6 +3913,7 @@ async fn gateway_verify(
                     status: 402,
                     ms: 0,
                     req_headers: std::collections::HashMap::new(),
+                    req_body: None,
                     res_headers,
                     res_body: None,
                     client_ip: "gateway".to_string(),
@@ -3951,6 +4007,7 @@ async fn gateway_verify(
                                 status: 200,
                                 ms: 0,
                                 req_headers,
+                                req_body: None,
                                 res_headers: std::collections::HashMap::new(),
                                 res_body: None,
                                 client_ip: "gateway".to_string(),
@@ -4045,6 +4102,37 @@ mod tests {
     use solana_pubkey::Pubkey;
     use std::collections::HashMap;
     use std::str::FromStr;
+
+    #[tokio::test]
+    #[serial]
+    async fn configured_session_store_never_falls_back_in_deployment_mode() {
+        let names = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let static_store = super::session_channel_store(false).await;
+        let missing_deployment_store = super::session_channel_store(true).await;
+        unsafe { std::env::set_var(names[0], "invalid://test") };
+        let invalid_deployment_store = super::session_channel_store(true).await;
+        for (name, value) in names.into_iter().zip(saved) {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+        let static_store = static_store.unwrap();
+        assert!(matches!(
+            static_store,
+            super::ConfiguredSessionStore::Static { durable: false, .. }
+        ));
+        assert_eq!(
+            static_store.reconciliation(),
+            super::SessionLifecycleReconciliation::Embedded
+        );
+        assert!(missing_deployment_store.is_err());
+        assert!(invalid_deployment_store.is_err());
+    }
 
     #[test]
     fn gateway_owns_session_lifecycle_for_memory_and_redis_stores() {
@@ -4297,6 +4385,21 @@ currencies:
         assert!(body.contains(
             "split recipient partner (Partner): mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp"
         ));
+    }
+
+    #[test]
+    fn surfpool_prep_notice_body_redacts_rpc_credentials() {
+        let secret = "must-not-reach-logs";
+        let body = surfpool_prep_notice_body(
+            &format!("https://user:{secret}@rpc.example/v1/{secret}?api-key={secret}"),
+            &[],
+            &[],
+            &[],
+            false,
+        );
+
+        assert_eq!(body, "rpc: https://rpc.example");
+        assert!(!body.contains(secret));
     }
 
     #[test]

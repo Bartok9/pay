@@ -172,7 +172,7 @@ pub struct DelegatedSessionStreamMeter {
 
 impl DelegatedSessionStreamMeter {
     pub fn from_forward(forward: SessionForward) -> Result<Self, BoxError> {
-        let plan = forward.settlement.as_deref().ok_or_else(|| {
+        let plan = forward.metered_plan().ok_or_else(|| {
             box_error(std::io::Error::other(
                 "delegated stream forward is missing its settlement plan",
             ))
@@ -210,7 +210,7 @@ impl DelegatedSessionStreamMeter {
     }
 
     pub fn supports(forward: &SessionForward) -> bool {
-        let Some(plan) = forward.settlement.as_deref() else {
+        let Some(plan) = forward.metered_plan() else {
             return false;
         };
         spec_from_metering(
@@ -306,7 +306,7 @@ impl DelegatedSessionStreamMeter {
         context_length: u64,
         usage_only_chunk: bool,
     ) -> Result<(), BoxError> {
-        let plan = self.forward.settlement.as_deref().ok_or_else(|| {
+        let plan = self.forward.metered_plan().ok_or_else(|| {
             box_error(std::io::Error::other(
                 "delegated stream meter lost its settlement plan",
             ))
@@ -789,6 +789,19 @@ impl SseUsageDecoder {
         }
         Ok(events)
     }
+}
+
+pub(super) fn sse_json_documents(body: &[u8]) -> Result<Vec<Value>, std::str::Utf8Error> {
+    let text = std::str::from_utf8(body)?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    // Unlike incremental decoding, a bounded buffered response can be scanned
+    // once without repeatedly shifting the remaining stream in a String.
+    Ok(text
+        .split("\n\n")
+        .filter_map(|block| parse_sse_event(block).data)
+        .filter_map(|data| serde_json::from_str(&data).ok())
+        .collect())
 }
 
 fn parse_sse_event(block: &str) -> SseUsageEvent {
@@ -1385,6 +1398,33 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert!(!has_stream_observable_dimension(&spec));
     }
 
+    #[test]
+    fn gemini_first_stream_event_fits_an_authorized_quarter_dollar_session() {
+        let mut input = dimension(MeterDirection::Input, BillingUnit::Tokens, None);
+        input.scale = 1_000_000;
+        input.tiers[0].price_usd = 0.345;
+        let mut output = dimension(MeterDirection::Output, BillingUnit::Tokens, None);
+        output.scale = 1_000_000;
+        output.tiers[0].price_usd = 2.875;
+        let metering = metering(vec![input, output]);
+        let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
+        let mut accumulator =
+            StreamUsageAccumulator::new(spec.clone(), SessionUsageHints::default());
+        assert!(accumulator
+            .observe_chunk(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"What\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                true,
+            )
+            .unwrap());
+        let mut gate = SessionUsageGate::new(spec, StablecoinSettlement::usdc(), 0, 1).unwrap();
+        let decision = gate
+            .observe(accumulator.observation(), GateMode::Streaming)
+            .unwrap();
+
+        assert_eq!(decision.target_cumulative_base_units(), 3);
+        assert!(decision.target_cumulative_base_units() <= 250_000);
+    }
+
     fn stream_test_blockhash_cache() -> BlockhashCache {
         let cache = BlockhashCache::new();
         cache.set(
@@ -1558,7 +1598,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 ceiling_usd: 0.001,
                 inferred_usage: None,
             },
-            10,
+            (10, 1_000),
+            solana_pubkey::Pubkey::new_unique().to_string(),
             reservation,
         );
         let meter = DelegatedSessionStreamMeter::from_forward(forward).unwrap();

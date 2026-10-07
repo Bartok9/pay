@@ -29,6 +29,7 @@ use sha2::{Sha256, Sha512};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::server::payment::TrustedPaymentIdentity;
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::{metering, payment, telemetry};
 
@@ -45,7 +46,52 @@ pub const STRIP_HEADERS: &[&str] = &[
     // which could log or leak it (the gate accepts the credential via either
     // `PAYMENT-SIGNATURE` or `X-PAYMENT`).
     "x-payment",
+    // Internal identity and routing metadata is minted only after payment
+    // verification. Pingora forwards its native request header separately
+    // from the sanitized HeaderMap, so these must be removed there too.
+    "x-pay-verified-payer",
+    "x-pay-verified-channel",
+    "x-pay-original-host",
+    "x-pay-gateway-host",
+    "x-pay-wallet-resolver-proof",
+    "x-pay-payment-policy",
+    "x-pay-payment-policy-version",
 ];
+
+/// Return an upstream URL that is safe to attach to logs and traces.
+///
+/// Query values may contain API keys, signed URLs, or user credentials, so the
+/// observability boundary keeps parameter names for diagnosis but never their
+/// values.
+pub fn upstream_url_for_logging(url: &reqwest::Url) -> String {
+    let mut safe = url.clone();
+    if url.query().is_some() {
+        let names = url
+            .query_pairs()
+            .map(|(name, _)| name.into_owned())
+            .collect::<Vec<_>>();
+        safe.set_query(None);
+        for name in names {
+            safe.query_pairs_mut().append_pair(&name, "[REDACTED]");
+        }
+    }
+    safe.to_string()
+}
+
+/// Format a reqwest failure without allowing its attached URL to expose query
+/// credentials in logs, traces, telemetry, or downstream error responses.
+pub fn upstream_error_for_logging(error: &reqwest::Error) -> String {
+    let mut safe = error.to_string();
+    if let Some(url) = error.url() {
+        safe = redact_url_in_error(&safe, url);
+    }
+    safe
+}
+
+/// Remove query values from an arbitrary error string that may embed `url`.
+pub fn redact_url_in_error(error: &str, url: &reqwest::Url) -> String {
+    error.replace(url.as_str(), &upstream_url_for_logging(url))
+}
 
 /// Percent-encode every ASCII byte except RFC 3986 unreserved characters.
 const RFC3986_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
@@ -131,7 +177,38 @@ pub async fn forward_request_with_session_metering(
     body: Bytes,
     session_context: Option<SessionStreamContext>,
 ) -> Result<Response, Response> {
-    let prepared = match prepare_upstream(api, &method, uri, headers, body.as_ref()).await? {
+    forward_request_with_session_metering_and_identity(
+        api,
+        method,
+        uri,
+        headers,
+        body,
+        session_context,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+pub async fn forward_request_with_session_metering_and_identity(
+    api: &ApiSpec,
+    method: Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+    session_context: Option<SessionStreamContext>,
+    trusted_identity: Option<&TrustedPaymentIdentity>,
+) -> Result<Response, Response> {
+    let prepared = match prepare_upstream_with_identity(
+        api,
+        &method,
+        uri,
+        headers,
+        body.as_ref(),
+        trusted_identity,
+    )
+    .await?
+    {
         UpstreamPlan::Respond(resp) => return Ok(resp),
         UpstreamPlan::Forward(prepared) => prepared,
     };
@@ -144,7 +221,7 @@ pub async fn forward_request_with_session_metering(
     for (name, value) in &prepared.headers {
         upstream_req = upstream_req.header(name.as_str(), value);
     }
-    let upstream_url = prepared.url.to_string();
+    let upstream_url = upstream_url_for_logging(&prepared.url);
 
     // Forward body. Always set content-length for POST/PUT/PATCH
     // (some upstreams like Google APIs require it even when empty).
@@ -155,9 +232,10 @@ pub async fn forward_request_with_session_metering(
     }
 
     let upstream_resp = upstream_req.send().await.map_err(|e| {
-        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &e.to_string());
-        tracing::error!(error = %e, upstream = %upstream_url, "Upstream request failed");
-        error_response(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"))
+        let error = upstream_error_for_logging(&e);
+        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &error);
+        tracing::error!(%error, upstream = %upstream_url, "Upstream request failed");
+        error_response(StatusCode::BAD_GATEWAY, "Upstream request failed")
     })?;
 
     // Build response.
@@ -234,6 +312,18 @@ pub async fn prepare_upstream(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<UpstreamPlan, Response> {
+    prepare_upstream_with_identity(api, method, uri, headers, body, None).await
+}
+
+#[allow(clippy::result_large_err)]
+pub async fn prepare_upstream_with_identity(
+    api: &ApiSpec,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    trusted_identity: Option<&TrustedPaymentIdentity>,
+) -> Result<UpstreamPlan, Response> {
     let path_and_query = uri
         .path_and_query()
         .map(|pq| pq.as_str())
@@ -269,13 +359,14 @@ pub async fn prepare_upstream(
         .upstream_url(path_and_query)
         .expect("Proxy routing must have a URL");
     let mut prepared = PreparedUpstreamRequest::new(&upstream_url).map_err(|e| {
-        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &e);
+        telemetry::record_upstream_error(&api.subdomain, uri.path(), "[invalid upstream URL]", &e);
         error_response(StatusCode::BAD_GATEWAY, &e)
     })?;
 
+    let upstream_log_url = upstream_url_for_logging(&prepared.url);
     tracing::debug!(
         subdomain = %api.subdomain,
-        upstream = %prepared.url,
+        upstream = %upstream_log_url,
         "Forwarding request"
     );
 
@@ -287,6 +378,29 @@ pub async fn prepare_upstream(
         }
         if let Ok(v) = value.to_str() {
             prepared.add_forwarded_header(name_str, v);
+        }
+    }
+
+    if let Some(identity) = trusted_identity {
+        let mut trusted_headers = HeaderMap::new();
+        payment::inject_original_host_header(
+            &mut trusted_headers,
+            identity.original_host.as_deref(),
+        );
+        if let Some(payer) = identity.payer.as_deref() {
+            payment::inject_verified_payer_headers(
+                &mut trusted_headers,
+                payer,
+                None,
+                identity.channel_id.as_deref(),
+            );
+        }
+        for (name, value) in trusted_headers {
+            if let Some(name) = name
+                && let Ok(value) = value.to_str()
+            {
+                prepared.add_forwarded_header(name.as_str(), value);
+            }
         }
     }
 
@@ -305,7 +419,7 @@ pub async fn prepare_upstream(
                 telemetry::record_upstream_error(
                     &api.subdomain,
                     uri.path(),
-                    prepared.url.as_str(),
+                    &upstream_url_for_logging(&prepared.url),
                     &e,
                 );
                 error_response(StatusCode::BAD_GATEWAY, &e)
@@ -340,7 +454,7 @@ pub async fn prepare_upstream(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        prepared.url.as_str(),
+                        &upstream_url_for_logging(&prepared.url),
                         &format!("OAuth2 token error: {e}"),
                     );
                     tracing::error!(error = %e, "Failed to fetch OAuth2 token");
@@ -362,7 +476,7 @@ pub async fn prepare_upstream(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        prepared.url.as_str(),
+                        &upstream_url_for_logging(&prepared.url),
                         &e,
                     );
                     error_response(StatusCode::BAD_GATEWAY, &e)
@@ -422,10 +536,25 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
         .unwrap()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedUpstreamRequest {
     pub url: reqwest::Url,
     pub headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for PreparedUpstreamRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let header_names = self
+            .headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("PreparedUpstreamRequest")
+            .field("url", &upstream_url_for_logging(&self.url))
+            .field("header_names", &header_names)
+            .finish()
+    }
 }
 
 impl PreparedUpstreamRequest {
@@ -1040,7 +1169,7 @@ async fn fetch_access_token(fetch: &AccessTokenFetchConfig) -> Result<FetchedTok
         .await
         .map_err(|e| format!("Access token response read failed: {e}"))?;
     if !status.is_success() {
-        return Err(format!("Access token request failed with {status}: {text}"));
+        return Err(format!("Access token request failed with {status}"));
     }
 
     let body: serde_json::Value =
@@ -1129,9 +1258,9 @@ struct CachedToken {
 }
 
 /// A freshly-fetched token with the provider-reported lifetime.
-struct FetchedToken {
-    access_token: String,
-    expires_in_secs: u64,
+pub(super) struct FetchedToken {
+    pub(super) access_token: String,
+    pub(super) expires_in_secs: u64,
 }
 
 /// Cache key: one entry per distinct (token_url, scopes, audience, client_id)
@@ -1262,7 +1391,7 @@ async fn fetch_oauth2_token(
     let access_token = body["access_token"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("No access_token in response: {body}"))?;
+        .ok_or_else(|| "OAuth2 response did not contain an access_token".to_string())?;
     let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
 
     Ok(FetchedToken {
@@ -1340,7 +1469,7 @@ async fn fetch_gcp_metadata_token(
     let access_token = body["access_token"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("No access_token: {body}"))?;
+        .ok_or_else(|| "ADC response did not contain an access_token".to_string())?;
     let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
 
     tracing::debug!("OAuth2 token from ADC");
@@ -1354,12 +1483,28 @@ async fn fetch_gcp_metadata_token(
 /// (Cloud Run / GCE), used to invoke IAM-protected services such as private
 /// Cloud Run. Unlike access tokens there is no ADC fallback: user credentials
 /// cannot mint audience-bound identity tokens.
-async fn fetch_gcp_metadata_identity_token(
+pub(super) async fn fetch_gcp_metadata_identity_token(
     client: &reqwest::Client,
     audience: &str,
 ) -> Result<FetchedToken, String> {
+    // Cloud Run's platform-local metadata endpoint uses HTTP, not public
+    // HTTPS. This fixed hostname is not the external service receiving the
+    // token; that service is authenticated separately with the bound audience.
+    fetch_gcp_metadata_identity_token_at(
+        client,
+        audience,
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity",
+    )
+    .await
+}
+
+pub(super) async fn fetch_gcp_metadata_identity_token_at(
+    client: &reqwest::Client,
+    audience: &str,
+    endpoint: &str,
+) -> Result<FetchedToken, String> {
     let resp = client
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity")
+        .get(endpoint)
         .query(&[("audience", audience)])
         .header("Metadata-Flavor", "Google")
         .timeout(std::time::Duration::from_secs(2))
@@ -1373,17 +1518,18 @@ async fn fetch_gcp_metadata_identity_token(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "GCP metadata identity endpoint returned {status}: {body}"
-        ));
+        return Err(format!("GCP metadata identity endpoint returned {status}"));
     }
 
-    let token = resp
-        .text()
+    // Bound chunked bodies too; metadata credentials must never cause an
+    // unbounded allocation before the authenticated resolver request.
+    let bytes = super::deployment_policy::read_bounded_response(resp, 16 * 1024)
         .await
-        .map_err(|e| format!("Failed to read identity token: {e}"))?;
-    let token = token.trim().to_string();
+        .map_err(|_| "Failed to read bounded identity token".to_string())?;
+    let token = std::str::from_utf8(&bytes)
+        .map_err(|_| "Identity token is not UTF-8".to_string())?
+        .trim()
+        .to_string();
 
     // The /identity endpoint returns a raw JWT with no expiry envelope —
     // read the remaining lifetime from the token's own `exp` claim.
@@ -1429,6 +1575,38 @@ mod tests {
         HmacSignatureDestination, HmacStringEncoding, HmacTarget, HmacTargetType,
         HmacTimestampFormat, HttpMethod, RoutingConfig,
     };
+
+    #[test]
+    fn upstream_log_url_redacts_every_query_value() {
+        let url = reqwest::Url::parse(
+            "https://api.example.com/v1?key=super-secret&cursor=also-sensitive",
+        )
+        .unwrap();
+
+        let safe = upstream_url_for_logging(&url);
+
+        assert!(safe.contains("key=%5BREDACTED%5D"));
+        assert!(safe.contains("cursor=%5BREDACTED%5D"));
+        assert!(!safe.contains("super-secret"));
+        assert!(!safe.contains("also-sensitive"));
+    }
+
+    #[test]
+    fn prepared_request_debug_never_exposes_credentials() {
+        let request = PreparedUpstreamRequest {
+            url: reqwest::Url::parse("https://api.example.com/v1?key=query-secret").unwrap(),
+            headers: vec![(
+                "authorization".to_string(),
+                "Bearer header-secret".to_string(),
+            )],
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("authorization"));
+        assert!(!debug.contains("query-secret"));
+        assert!(!debug.contains("header-secret"));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1806,9 +1984,81 @@ mod tests {
         // x402 credential headers must never be forwarded upstream.
         assert!(STRIP_HEADERS.contains(&"payment-signature"));
         assert!(STRIP_HEADERS.contains(&"x-payment"));
+        assert!(STRIP_HEADERS.contains(&"x-pay-verified-payer"));
+        assert!(STRIP_HEADERS.contains(&"x-pay-verified-channel"));
+        assert!(STRIP_HEADERS.contains(&"x-pay-original-host"));
+    }
+
+    #[tokio::test]
+    async fn trusted_payment_identity_replaces_spoofed_forwarding_headers() {
+        let api = make_api("test");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pay-verified-payer", HeaderValue::from_static("attacker"));
+        headers.insert(
+            "x-pay-verified-channel",
+            HeaderValue::from_static("attacker"),
+        );
+        headers.insert(
+            "x-pay-original-host",
+            HeaderValue::from_static("evil.example"),
+        );
+        let identity = TrustedPaymentIdentity {
+            payer: Some("trusted-payer".into()),
+            channel_id: Some("trusted-channel".into()),
+            original_host: Some("worker.cpu.gcp.gateway-402.com".into()),
+        };
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            Some(&identity),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        assert_eq!(
+            prepared.header_value("x-pay-verified-payer"),
+            Some("trusted-payer")
+        );
+        assert_eq!(
+            prepared.header_value("x-pay-verified-channel"),
+            Some("trusted-channel")
+        );
+        assert_eq!(
+            prepared.header_value("x-pay-original-host"),
+            Some("worker.cpu.gcp.gateway-402.com")
+        );
+
+        let identity = TrustedPaymentIdentity {
+            payer: None,
+            channel_id: None,
+            original_host: Some("worker.cpu.gcp.gateway-402.com".into()),
+        };
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            Some(&identity),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        assert_eq!(prepared.header_value("x-pay-verified-payer"), None);
+        assert_eq!(prepared.header_value("x-pay-verified-channel"), None);
+        assert_eq!(
+            prepared.header_value("x-pay-original-host"),
+            Some("worker.cpu.gcp.gateway-402.com")
+        );
     }
 
     #[test]
+    #[serial_test::serial(alibaba_hmac_env)]
     fn generic_hmac_reproduces_alibaba_signature() {
         let body = br#"{"FormatType":"text","SourceLanguage":"en","TargetLanguage":"zh","SourceText":"Hello"}"#;
         let mut prepared = PreparedUpstreamRequest::new(
@@ -2310,6 +2560,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(alibaba_hmac_env)]
     async fn forward_request_injects_hmac_auth() {
         #[derive(Debug, Clone, Default)]
         struct CapturedRequest {

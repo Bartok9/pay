@@ -32,8 +32,10 @@ use pay_core::server::gate::{
     settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
+use pay_core::server::payment::{TrustedPaymentIdentity, strip_internal_identity_headers};
 use pay_core::server::proxy::{
-    STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
+    STRIP_HEADERS, UpstreamPlan, prepare_upstream_with_identity, redact_url_in_error,
+    routing_signs_request_body, upstream_error_for_logging, upstream_url_for_logging,
 };
 use pay_core::server::session_stream::DelegatedSessionStreamMeter;
 use pay_core::server::telemetry;
@@ -105,6 +107,7 @@ pub struct Ctx {
     /// Normalized request path retained for paid-request and upstream-error
     /// metrics even when debugger exchange logging is disabled.
     request_path: String,
+    trusted_identity: Option<TrustedPaymentIdentity>,
 }
 
 struct PendingUpto {
@@ -163,6 +166,8 @@ pub struct Http402Gate<S: PaymentState> {
     state: S,
     /// `host:port` of the internal axum service handling the control plane.
     control_plane: String,
+    deployment_policy_resolver:
+        Option<std::sync::Arc<pay_core::server::deployment_policy::DeploymentPolicyResolver>>,
 }
 
 impl<S: PaymentState> Http402Gate<S> {
@@ -170,7 +175,18 @@ impl<S: PaymentState> Http402Gate<S> {
         Self {
             state,
             control_plane: control_plane.into(),
+            deployment_policy_resolver: None,
         }
+    }
+
+    pub fn with_deployment_policy_resolver(
+        mut self,
+        resolver: Option<
+            std::sync::Arc<pay_core::server::deployment_policy::DeploymentPolicyResolver>,
+        >,
+    ) -> Self {
+        self.deployment_policy_resolver = resolver;
+        self
     }
 
     /// Resolve the API spec for a host — subdomain match, single-API fallback —
@@ -196,8 +212,9 @@ impl<S: PaymentState> Http402Gate<S> {
         uri: &Uri,
         headers: &http::HeaderMap,
         body: &[u8],
+        trusted_identity: Option<&TrustedPaymentIdentity>,
     ) -> Result<UpstreamPlan, axum::response::Response> {
-        prepare_upstream(api, method, uri, headers, body).await
+        prepare_upstream_with_identity(api, method, uri, headers, body, trusted_identity).await
     }
 
     /// Plan the upstream for a Forward/Passthrough decision: control-plane → the
@@ -240,7 +257,16 @@ impl<S: PaymentState> Http402Gate<S> {
                 .await;
         }
         // No body-signing auth: an empty placeholder body is safe for prep.
-        match prepare_upstream(api, method, uri, headers, &[]).await {
+        match prepare_upstream_with_identity(
+            api,
+            method,
+            uri,
+            headers,
+            &[],
+            ctx.trusted_identity.as_ref(),
+        )
+        .await
+        {
             Ok(UpstreamPlan::Forward(prepared)) => {
                 ctx.target = Some(target_from_prepared(prepared, api.subdomain.clone()));
                 Ok(false)
@@ -388,6 +414,35 @@ impl<S: PaymentState> Http402Gate<S> {
         uri: &Uri,
         headers: &http::HeaderMap,
     ) -> pingora::Result<bool> {
+        let deadline = ctx.session.as_ref().and_then(|forward| forward.deadline());
+        let forwarding =
+            self.forward_buffered_inner(session, ctx, path, host, method, uri, headers);
+        match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, forwarding).await {
+                Ok(result) => result,
+                Err(_) => {
+                    ctx.session.take();
+                    Err(pingora::Error::explain(
+                        pingora::ErrorType::HTTPStatus(504),
+                        "deployment request lifetime exceeded",
+                    ))
+                }
+            },
+            None => forwarding.await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_buffered_inner(
+        &self,
+        session: &mut Session,
+        ctx: &mut Ctx,
+        path: &str,
+        host: Option<&str>,
+        method: &http::Method,
+        uri: &Uri,
+        headers: &http::HeaderMap,
+    ) -> pingora::Result<bool> {
         let Some(api) = self.resolve_api(host.unwrap_or("")) else {
             let extra = self.drain_payment_headers(ctx, false).await;
             write_buffered_response(
@@ -419,7 +474,14 @@ impl<S: PaymentState> Http402Gate<S> {
         };
 
         let prepared = match self
-            .prepare_buffered_request(api, method, uri, headers, body.as_ref())
+            .prepare_buffered_request(
+                api,
+                method,
+                uri,
+                headers,
+                body.as_ref(),
+                ctx.trusted_identity.as_ref(),
+            )
             .await
         {
             Ok(UpstreamPlan::Respond(resp)) => {
@@ -442,7 +504,7 @@ impl<S: PaymentState> Http402Gate<S> {
             .or_else(|| {
                 ctx.session
                     .as_ref()
-                    .and_then(|pending| pending.settlement.as_deref())
+                    .and_then(|pending| pending.metered_plan())
             })
             .map(|plan| metering::upto_response_body_limit(&plan.metering))
             // Body-signing endpoints are buffered for request preparation, not
@@ -464,16 +526,18 @@ impl<S: PaymentState> Http402Gate<S> {
             upstream_req = upstream_req.header("content-length", "0");
         }
 
+        if let Some(forward) = &ctx.session {
+            forward.require_active().await.map_err(|error| {
+                pingora::Error::explain(pingora::ErrorType::HTTPStatus(503), error)
+            })?;
+        }
         let upstream = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                telemetry::record_upstream_error(
-                    &api.subdomain,
-                    uri.path(),
-                    prepared.url.as_str(),
-                    &e.to_string(),
-                );
-                tracing::error!(error = %e, upstream = %prepared.url, "buffered upstream request failed");
+                let error = upstream_error_for_logging(&e);
+                let upstream = upstream_url_for_logging(&prepared.url);
+                telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream, &error);
+                tracing::error!(%error, %upstream, "buffered upstream request failed");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -493,11 +557,24 @@ impl<S: PaymentState> Http402Gate<S> {
             telemetry::record_upstream_error(
                 &api.subdomain,
                 uri.path(),
-                prepared.url.as_str(),
+                &upstream_url_for_logging(&prepared.url),
                 &format!("upstream returned {status}"),
             );
         }
         let response_headers = filtered_response_headers(upstream.headers());
+        if is_streamed_response(&response_headers)
+            && ctx
+                .session
+                .as_ref()
+                .and_then(|forward| forward.deadline())
+                .is_some()
+        {
+            ctx.session.take();
+            return Err(pingora::Error::explain(
+                pingora::ErrorType::HTTPStatus(502),
+                "streaming is unsupported for fixed deployment charging",
+            ));
+        }
         let delegated_stream = ctx
             .session
             .as_ref()
@@ -527,13 +604,14 @@ impl<S: PaymentState> Http402Gate<S> {
         let body = match collect_reqwest_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
+                let error = redact_url_in_error(&e.to_string(), &prepared.url);
                 telemetry::record_upstream_error(
                     &api.subdomain,
                     uri.path(),
-                    prepared.url.as_str(),
-                    &e.to_string(),
+                    &upstream_url_for_logging(&prepared.url),
+                    &error,
                 );
-                tracing::warn!(error = %e, "failed to buffer upstream response body");
+                tracing::warn!(%error, "failed to buffer upstream response body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -689,7 +767,7 @@ impl<S: PaymentState> Http402Gate<S> {
             .or_else(|| {
                 ctx.session
                     .as_mut()
-                    .and_then(|pending| pending.settlement.as_deref_mut())
+                    .and_then(|pending| pending.metered_plan_mut())
             })
         else {
             return;
@@ -736,7 +814,15 @@ impl<S: PaymentState> Http402Gate<S> {
             Ok(body) => body,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to buffer inline response for x402 upto");
-                Bytes::new()
+                let extra = self.drain_payment_headers(ctx, false).await;
+                return write_buffered_response(
+                    session,
+                    StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
+                    Bytes::from_static(b"{\"error\":\"upstream_body_read_failed\"}"),
+                    extra,
+                )
+                .await;
             }
         };
         if status.is_success() {
@@ -788,6 +874,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             buffered_usage: None,
             logged_payment_headers: Vec::new(),
             request_path: String::new(),
+            trusted_identity: None,
         }
     }
 
@@ -795,12 +882,28 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         let rh = session.req_header();
         let method = rh.method.clone();
         let uri = rh.uri.clone();
-        let headers = rh.headers.clone();
+        let mut headers = rh.headers.clone();
 
-        let path = uri.path().trim_start_matches('/').to_string();
+        let path = match pay_core::server::gate::gate_path(uri.path()) {
+            Ok(path) => path.to_string(),
+            Err(response) => {
+                write_gate_response(session, response).await?;
+                return Ok(true);
+            }
+        };
         ctx.request_path = format!("/{path}");
+        // Cloud Run's serverless NEG rewrites Host to run.app. In deployment
+        // mode require the original Host inserted by the CPU load balancer,
+        // which overwrites any client-supplied header of the same name.
+        let host = if self.deployment_policy_resolver.is_some() {
+            gateway_host(&headers, &uri)
+        } else {
+            request_host(&headers, &uri)
+        };
+        // Discard internal headers before payment evaluation and observability
+        // capture. Only authenticated identity may be restored upstream.
+        strip_internal_identity_headers(&mut headers);
         let str_h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
-        let host = str_h("host").map(str::to_string);
 
         // Capture request-side facts for the PDB exchange emitted in `logging`.
         // Skip the control plane's own paths (`/__402/*`, `/openapi.json`,
@@ -854,6 +957,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         };
 
         let decision = PaymentGate::new(self.state.clone())
+            .with_deployment_policy_resolver(self.deployment_policy_resolver.clone())
             .evaluate(&gate_req)
             .await;
         match decision {
@@ -868,6 +972,15 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 batch,
                 paid_request,
             } => {
+                ctx.trusted_identity = Some(TrustedPaymentIdentity {
+                    payer: session_forward
+                        .as_ref()
+                        .and_then(|pending| pending.verified_payer.clone()),
+                    channel_id: session_forward
+                        .as_ref()
+                        .map(|pending| pending.channel_id.clone()),
+                    original_host: host.clone(),
+                });
                 ctx.receipt = receipt;
                 ctx.paid_request = paid_request;
                 // x402 `batch-settlement`: the voucher is verified and the
@@ -1297,10 +1410,8 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
+            let value = String::from_utf8_lossy(v.as_bytes()).into_owned();
+            (k.as_str().to_string(), value)
         })
         .collect()
 }
@@ -1309,12 +1420,37 @@ fn header_pairs_from_owned(headers: Vec<(HeaderName, HeaderValue)>) -> Vec<(Stri
     headers
         .into_iter()
         .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
+            let value = String::from_utf8_lossy(v.as_bytes()).into_owned();
+            (k.as_str().to_string(), value)
         })
         .collect()
+}
+
+fn request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    let mut hosts = headers.get_all(http::header::HOST).iter();
+    let host = hosts.next().and_then(|value| value.to_str().ok());
+    if hosts.next().is_some() {
+        return None;
+    }
+    let authority = uri.authority().map(|authority| authority.as_str());
+    match (host, authority) {
+        (Some(host), Some(authority)) if host != authority => None,
+        (Some(host), _) => Some(host.to_string()),
+        (None, Some(authority)) if !headers.contains_key(http::header::HOST) => {
+            Some(authority.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn gateway_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    request_host(headers, uri)?;
+    let mut values = headers.get_all("x-pay-gateway-host").iter();
+    let host = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 fn is_control_plane(path: &str) -> bool {
@@ -1330,7 +1466,7 @@ fn target_from_prepared(
     subdomain: String,
 ) -> Target {
     let url = prepared.url;
-    let upstream = url.to_string();
+    let upstream = upstream_url_for_logging(&url);
     let tls = url.scheme() == "https";
     let host = url.host_str().unwrap_or("").to_string();
     let port = url
@@ -1421,14 +1557,7 @@ fn filtered_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap 
 }
 
 fn is_streamed_response(headers: &HeaderMap) -> bool {
-    headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| {
-            let ct = ct.to_ascii_lowercase();
-            ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson")
-        })
-        .unwrap_or(false)
+    pay_core::server::gate::is_streaming_response(headers)
 }
 
 fn is_sse_response(headers: &HeaderMap) -> bool {
@@ -1535,10 +1664,10 @@ async fn write_axum_response(
 mod tests {
     use super::{
         BatchResponseCapture, Http402Gate, MAX_BATCH_CACHED_RESPONSE_BYTES,
-        buffered_upstream_headers, filtered_response_headers, is_control_plane,
-        is_streamed_response,
+        buffered_upstream_headers, filtered_response_headers, gateway_host, header_pairs,
+        is_control_plane, is_streamed_response, request_host,
     };
-    use http::{HeaderMap, HeaderValue, StatusCode, header};
+    use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
     use pay_core::PaymentState;
     use pay_core::server::gate::delegated_session_receipt_annotation;
     use pay_core::server::proxy::UpstreamPlan;
@@ -1562,6 +1691,201 @@ mod tests {
         fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
             None
         }
+    }
+
+    async fn request_session(path: &str) -> (pingora::proxy::Session, tokio::net::TcpStream) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: invalid-host\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let stream = pingora::protocols::l4::stream::Stream::from(server);
+        let mut session = pingora::proxy::Session::new_h1(Box::new(stream));
+        assert!(session.read_request().await.unwrap());
+        (session, client)
+    }
+
+    #[tokio::test]
+    async fn pingora_rejects_ambiguous_paths_before_policy_or_upstream() {
+        use pingora::proxy::ProxyHttp;
+        use tokio::io::AsyncReadExt;
+        let resolver = pay_core::server::deployment_policy::DeploymentPolicyResolver::new(
+            "https://resolver.example/__402/payment-policy",
+            "https://resolver.example",
+            "gateway.example",
+        )
+        .unwrap();
+        let gate = Http402Gate::new(BodySigningState { apis: vec![] }, "127.0.0.1:1")
+            .with_deployment_policy_resolver(Some(std::sync::Arc::new(resolver)));
+        for path in ["//foo", "///foo?x=1", "//.well-known/test"] {
+            let (mut session, mut client) = request_session(path).await;
+            let mut ctx = gate.new_ctx();
+            assert!(gate.request_filter(&mut session, &mut ctx).await.unwrap());
+            assert!(ctx.target.is_none(), "must not plan upstream");
+            assert!(ctx.session.is_none());
+            drop(session);
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 400"));
+            // The deliberately invalid host would instead fail policy host
+            // classification if the resolver were reached.
+            assert!(response.contains("invalid_request_path"), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pingora_preserves_normal_path_and_query() {
+        use pingora::proxy::ProxyHttp;
+        let mut api = body_signing_api();
+        api.routing = RoutingConfig::Proxy {
+            url: "http://127.0.0.1:1".into(),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        let gate = Http402Gate::new(BodySigningState { apis: vec![api] }, "127.0.0.1:1");
+        for path in ["/foo", "/foo?x=%2F&x=2", "/foo//bar?x=1"] {
+            let (mut session, _client) = request_session(path).await;
+            let mut ctx = gate.new_ctx();
+            assert!(!gate.request_filter(&mut session, &mut ctx).await.unwrap());
+            match &ctx.target {
+                Some(super::Target::Api { path_and_query, .. }) => assert_eq!(path_and_query, path),
+                _ => panic!("expected real upstream target"),
+            }
+            assert_eq!(
+                session.req_header().uri.path_and_query().unwrap().as_str(),
+                path
+            );
+            assert_eq!(ctx.request_path, path.split('?').next().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_response_body_error_fails_closed() {
+        use pingora::proxy::ProxyHttp;
+        use tokio::io::AsyncReadExt;
+        let gate = Http402Gate::new(BodySigningState { apis: vec![] }, "127.0.0.1:1");
+        let (mut session, mut client) = request_session("/foo").await;
+        let mut ctx = gate.new_ctx();
+        let body = axum::body::Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("broken upstream body"))
+        }));
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", "15")
+            .body(body)
+            .unwrap();
+        gate.finish_buffered_axum_response(&mut session, &mut ctx, response)
+            .await
+            .unwrap();
+        drop(session);
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(response.contains("upstream_body_read_failed"));
+        assert!(!response.contains("payment-receipt"));
+    }
+
+    #[test]
+    fn request_host_falls_back_to_http2_authority() {
+        let headers = HeaderMap::new();
+        let uri: Uri = "https://worker.cpu.gcp.gateway-402.com/latest"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            request_host(&headers, &uri).as_deref(),
+            Some("worker.cpu.gcp.gateway-402.com")
+        );
+    }
+
+    #[test]
+    fn request_host_rejects_conflicting_host_and_authority() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("explicit.example"),
+        );
+        let uri: Uri = "https://authority.example/latest".parse().unwrap();
+
+        assert_eq!(request_host(&headers, &uri), None);
+    }
+
+    #[test]
+    fn request_host_ignores_caller_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("rewritten-backend.run.app"),
+        );
+        headers.insert(
+            "x-pay-forwarded-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        let uri: Uri = "https://rewritten-backend.run.app/latest".parse().unwrap();
+
+        assert_eq!(
+            request_host(&headers, &uri).as_deref(),
+            Some("rewritten-backend.run.app")
+        );
+    }
+
+    #[test]
+    fn request_host_never_adopts_forwarded_host_without_authority() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        headers.insert(
+            "x-pay-forwarded-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(request_host(&headers, &"/latest".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn deployment_requires_overwritten_gateway_host() {
+        let uri: Uri = "https://rewritten-backend.run.app/latest".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("rewritten-backend.run.app"),
+        );
+        headers.insert(
+            "x-pay-forwarded-host",
+            HeaderValue::from_static("attacker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(gateway_host(&headers, &uri), None);
+        headers.insert(
+            "x-pay-gateway-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(
+            gateway_host(&headers, &uri).as_deref(),
+            Some("worker.cpu.gcp.gateway-402.com")
+        );
+        headers.append(
+            "x-pay-gateway-host",
+            HeaderValue::from_static("attacker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(gateway_host(&headers, &uri), None);
+        headers.remove("x-pay-gateway-host");
+        headers.insert(
+            "x-pay-gateway-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(
+            gateway_host(
+                &headers,
+                &"https://conflicting.run.app/latest".parse().unwrap()
+            ),
+            None
+        );
     }
 
     fn body_signing_api() -> ApiSpec {
@@ -1697,6 +2021,50 @@ mod tests {
     }
 
     #[test]
+    fn debugger_header_capture_preserves_credentials_for_safe_projection() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        headers.insert(
+            "payment-signature",
+            HeaderValue::from_static("signed-payment"),
+        );
+        headers.insert(
+            "mcp-session-id",
+            HeaderValue::from_static("session-capability"),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let captured = header_pairs(&headers);
+
+        assert!(
+            captured
+                .iter()
+                .any(|(name, value)| { name == "authorization" && value == "Bearer secret" })
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(name, value)| { name == "payment-signature" && value == "signed-payment" })
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(name, value)| { name == "mcp-session-id" && value == "session-capability" })
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(name, value)| { name == "content-type" && value == "application/json" })
+        );
+    }
+
+    #[test]
     fn filtered_response_headers_preserve_content_encoding() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -1764,6 +2132,7 @@ mod tests {
                 &"/v1/generate".parse().unwrap(),
                 &HeaderMap::new(),
                 b"hello",
+                None,
             )
             .await
             .expect("request prepares");

@@ -25,6 +25,10 @@ hand-copied program logic or account layout.
 - A transaction is only signed and sent when **`DRY_RUN=false`** is explicitly
   set. Any other value (unset, `true`, `1`, garbage) keeps dry-run on.
 - Always run a dry-run first and read the plan before setting `DRY_RUN=false`.
+- `close-channels` requires an existing, unbound session record before acting
+  when Redis is configured. Missing, malformed, or deployment-bound ownership
+  is not permission to adopt a channel discovered on-chain. Live runs require
+  Redis; a dry-run without Redis cannot establish ownership.
 
 ## Environment variables
 
@@ -54,6 +58,9 @@ hand-copied program logic or account layout.
 | `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for each scheme's independent reconciliation lease. |
 | `RUN_ONCE` | no | `true` | Keep one-shot behavior for manual Cloud Run Job executions. Set to `false` for the continuous worker. |
 | `SETTLEMENT_INTERVAL_SECONDS` | no | `10` | Delay between complete MPP and x402 reconciliation sweeps when `RUN_ONCE=false`. Set this to `240` for a four-minute x402 settlement clock. |
+| `PAY_RESOURCE_CLEANUP_DRIVERS` | no | empty | Comma-separated cleanup drivers: `google-cloud-functions`, `gcp-firestore`. Unknown entries fail startup instead of silently leaking resources. |
+| `PAY_RESOURCE_CLEANUP_INTERVAL_SECONDS` | no | `60` | Minimum delay between provider cleanup scans for one channel. |
+| `PAY_RESOURCE_CLEANUP_QUIET_SECONDS` | no | `7200` | Repeated-empty-scan window before the Redis retry anchor may be removed. |
 
 The fee-payer keys intentionally share pay-api's `send.fee_payer.*` env names so
 a single Doppler config drives both. Job-specific overrides use the `JOBS_`
@@ -113,13 +120,24 @@ dry-run, any hard failure makes the process exit non-zero.
 deployment or manual execution cannot duplicate work while unrelated session
 and batch namespaces can progress independently.
 
-For MPP sessions it cursor-scans the session namespace, skips sealed and
+For legacy MPP sessions it cursor-scans the session namespace, skips sealed and
 pull-mode records, and fetches every candidate channel from Solana. If a
 push-channel account is already absent at confirmed commitment, the worker
-deletes its terminal Redis record immediately. For active channels it submits
-a voucher only when the stored cumulative amount is strictly greater than the
-on-chain watermark. For idle channels it atomically claims the still-due Redis
-deadline, settles the latest voucher, seals, and distributes the channel.
+deletes its terminal Redis record after resource cleanup completes. For active
+channels it submits a voucher only when the stored cumulative amount is
+strictly greater than the on-chain watermark. For idle channels it atomically
+claims the still-due Redis deadline, settles the latest voucher, seals, and
+distributes the channel.
+
+The same sweep garbage-collects provider resources leased to an MPP channel
+once it is spent, closing, sealed, or absent on-chain. Compute functions,
+schedule triggers, and managed document stores carry a one-way hash of the
+verified channel ID. Cleanup is provider-driver based and retry-safe. The
+store-backed close deadline prevents cleanup racing a top-up. The
+worker retains the Redis record as its retry anchor and requires a configurable
+quiet window of repeated empty scans before declaring cleanup complete; this
+prevents an accepted asynchronous deployment from appearing after one empty
+scan and escaping collection.
 
 For x402 batch settlement it uses the same one-fetch/one-candidate pipeline:
 claim every newer stored voucher and distribute the delta committed by the
@@ -134,6 +152,100 @@ Deployed as one continuously-running instance reconciling on an interval (see
 available for manual diagnostics. Proxy instances persist request-start
 activity and vouchers; they do not own a lifecycle clock when configured with
 the durable Redis store.
+
+### Deployment-bound sessions (rollout guarded)
+
+The workspace pins the coordinated pay-kit binding/recovery APIs at
+`4c29fba423d94dbb088147ba47533d54034812bb`, the merged pay-kit `main` commit.
+Locked tests use that revision without local overrides. Production enablement
+remains guarded; local tests are not evidence of deployed settlement.
+
+The worker restores `SessionConfigSnapshot` from each durable binding and
+checks its ordered payout against the immutable deployment policy. It does
+not resolve the current policy or require the deployment to still exist.
+Changes to price, recipients, or deployment availability cannot rewrite an
+already-funded channel's terms. The stored program owner, mint, payee,
+authorized signer, open slot, and distribution hash must match chain state.
+Malformed or unsupported bindings stop that channel's reconciliation.
+
+Pending opens are selected from the raw store scan and passed to pay-kit's
+`resume_pending_open` before the active binding guard. No client retry or
+current-policy lookup triggers this recovery. Dry-run leaves pending opens
+unchanged. Uncertain or failed recovery retains the record; the worker does
+not infer that a missing account proves an opening transaction cannot land.
+Attempts retired by finalized expiry reconciliation retain a terminal tombstone
+and are skipped before restoration or chain operations.
+
+Bound closes use the same atomic `claim_close` transition as request capacity
+reservations. An active reservation or another worker's live close lease
+prevents closure. Close ownership renews every one-third of
+`SETTLEMENT_LOCK_TTL_SECONDS` and is checked again before submission.
+Expired ownership can be reclaimed after a crash; beginning closure
+permanently blocks new request reservations.
+Verified on-chain Closing/Sealed state requests reconciliation independently of
+the idle deadline. The guarded direct submission path rechecks ownership and
+the current payout instructions before each send, including retries. It cannot
+recall an already submitted transaction or provide atomic Redis/on-chain fencing.
+
+Bound records never enter fleet resource cleanup, static batch settlement, or
+`close-channels` reclamation. Their final ownership records are retained
+without the legacy finalized-record TTL. This prevents later chain discovery
+from treating an expired bound row as legacy, but means durable storage grows
+with channel count and bound rent reclamation is not implemented here. A
+separate audited tombstone-retention and bound-reclamation policy is required.
+
+If an ownership row is missing, restore the original validated record from a
+trusted durable backup, including binding, snapshot, pending intent, and
+accounting watermarks. Then run `settle-sessions` with dry-run enabled and
+review the result. Do not fabricate a legacy row, remove binding metadata, or
+copy today's policy onto an old channel to bypass the guard. Chain-only legacy
+orphan reclamation is deliberately blocked when ownership cannot be proven.
+
+The optional Redis CAS test uses a disposable server supplied through
+`PAY_WORKER_TEST_REDIS_URL`. From `rust/`, with the coordinated dependency
+available:
+
+```sh
+cargo test -p pay-worker --bin settle-sessions \
+  redis_cas_reservation_close_and_external_job_retries -- --ignored
+```
+
+It exercises concurrent request reservation and close claims, lease renewal,
+external-job contention, and takeover after expiry against Redis's real CAS.
+
+### Provider metadata reconciliation
+
+`reconcile-resources` is a separate one-shot command. It constructs only the
+selected provider drivers; it does not initialize Redis, chain RPC, a signer,
+wallet resolution, or the financial settlement runtime.
+
+For Google policy cleanup, configure:
+
+| Environment | Requirement |
+| --- | --- |
+| `PAY_RESOURCE_CLEANUP_DRIVERS` | `google-cloud-functions` |
+| `COMPUTE_GOOGLE_PROJECT` | Project containing the managed functions |
+| `COMPUTE_GOOGLE_REGION` | Policy region; must match the compute service |
+| `COMPUTE_GATEWAY_DOMAIN` | Gateway domain; must match the stored policy identities |
+| `COMPUTE_PAYMENT_POLICY_DATABASE` | Explicit named Firestore database, never `(default)` |
+| `DRY_RUN` | Defaults to `true`; only exact `false` enables mutation |
+
+The driver's ordinary deletion path retires policies before requesting provider
+deletion. The orphan hook handles out-of-band deletion and interrupted cleanup.
+It retains tombstones for seven days after verified absence or replacement,
+then rechecks provider state and uses Firestore CAS for physical reclamation.
+Provider errors are not absence evidence. Existing bound Redis records remain
+under the financial retention rules above.
+
+The bounded sweep stores progress in `pay_compute_policy_reconciliation`, separate
+from `pay_compute_payment_policies`. Dry runs write neither collection. Failed
+records are logged and produce a failed job for retry, while progress through
+other records is preserved.
+
+The gateway infrastructure provides an independently enabled ten-minute schedule
+with a dedicated service account. Manual executions remain dry-run by default.
+Only provider lookup and named-database credentials are needed; do not supply
+wallet proofs, Redis URLs, KMS keys, or chain RPC secrets to this job.
 
 ### Distribution preimage recovery
 

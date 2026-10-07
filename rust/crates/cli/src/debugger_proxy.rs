@@ -16,6 +16,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use pay_core::client::fetch::{DEBUGGER_NO_FOLLOW_HEADER, DEBUGGER_NO_FOLLOW_HEADER_VALUE};
+use std::sync::OnceLock;
 
 /// Header carrying the original destination URL.
 pub const FORWARD_HEADER: &str = "x-pay-forward-to";
@@ -28,6 +29,14 @@ const PORT_STEP: u16 = 1000;
 
 /// Maximum number of ports to try before giving up.
 const MAX_PORT_ATTEMPTS: u16 = 10;
+
+static PDB_STATE: OnceLock<pay_pdb::PdbState> = OnceLock::new();
+
+/// Shared debugger state for in-process clients such as the Goose payer proxy.
+/// MCP curl traffic still reaches the same state through the HTTP forwarder.
+pub fn pdb_state() -> Option<pay_pdb::PdbState> {
+    PDB_STATE.get().cloned()
+}
 
 /// Find an available port starting from `DEFAULT_PORT`, stepping by
 /// `PORT_STEP` (1402 → 2402 → 3402 → …).
@@ -56,6 +65,17 @@ pub fn start_background() -> pay_core::Result<String> {
     let port = find_available_port()?;
     let bind = format!("127.0.0.1:{port}");
     let bind_clone = bind.clone();
+    let pdb = pay_pdb::PdbState::new(serde_json::json!({
+        "recipient": "",
+        "network": "proxy",
+        "rpcUrl": "",
+        "endpoints": {
+            "mpp": [],
+            "x402": [],
+            "oauth": []
+        }
+    }));
+    let _ = PDB_STATE.set(pdb.clone());
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -64,16 +84,6 @@ pub fn start_background() -> pay_core::Result<String> {
             .expect("debugger proxy runtime");
 
         rt.block_on(async move {
-            let pdb = pay_pdb::PdbState::new(serde_json::json!({
-                "recipient": "",
-                "network": "proxy",
-                "rpcUrl": "",
-                "endpoints": {
-                    "mpp": [],
-                    "x402": [],
-                    "oauth": []
-                }
-            }));
             pdb.spawn_cleanup();
 
             let pdb_state = pdb.clone();
@@ -155,6 +165,8 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
             return (StatusCode::BAD_REQUEST, format!("read body: {e}")).into_response();
         }
     };
+    let request_body_for_log =
+        (!body_bytes.is_empty()).then(|| String::from_utf8_lossy(&body_bytes).into_owned());
 
     let log_id = pdb.next_log_id();
     let start = std::time::Instant::now();
@@ -209,6 +221,7 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect(),
+                req_body: request_body_for_log.clone(),
                 res_headers: res_headers.clone(),
                 res_body: Some(res_body_for_log),
                 client_ip: "mcp".to_string(),
@@ -235,6 +248,7 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
                 status: 502,
                 ms: elapsed_ms,
                 req_headers: Default::default(),
+                req_body: request_body_for_log,
                 res_headers: Default::default(),
                 res_body: Some(e.to_string()),
                 client_ip: "mcp".to_string(),

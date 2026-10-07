@@ -144,10 +144,77 @@ pub struct InferenceInfo {
     pub tokens_prompt: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_completion: Option<u64>,
+    /// Prompt/input tokens served from a provider cache, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_cached: Option<u64>,
+    /// Completion/output tokens used for model reasoning, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_reasoning: Option<u64>,
+    /// Provider response identifier, such as an OpenAI completion id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// Terminal generation reason reported by the first choice/output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_per_sec: Option<f64>,
+}
+
+// ── Safe payment inspection metadata ──
+
+/// Non-secret facts decoded from payment credentials and settlement receipts.
+/// Raw credentials remain redacted; this is the debugger-safe projection used
+/// to explain channel actions and vouchers in the UI.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentDetails {
+    /// Human-readable channel operation, such as `voucher` or `channel topped up`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Settlement network identifier advertised by x402.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Asset symbol or mint identifier advertised by the payment offer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    /// Public payment-channel account identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// Public recipient advertised by the selected payment offer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    /// Human-readable amount deposited while opening or topping up a channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deposit_amount: Option<String>,
+    /// Human-readable server-authorized spending ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorized_amount: Option<String>,
+    /// Human-readable cumulative maximum claimable by the latest voucher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voucher_amount: Option<String>,
+    /// Fixed charge for this request in atomic units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge_amount: Option<String>,
+    /// Current channel deposit ceiling in atomic units, as reported by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_balance: Option<String>,
+    /// Server's latest accepted cumulative charge in atomic units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged_cumulative_amount: Option<String>,
+    /// Cumulative amount already claimed onchain, in atomic units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_claimed: Option<String>,
+    /// Human-readable amount reported by the settlement receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_amount: Option<String>,
+    /// Public settlement transaction signature used for receipt navigation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_reference: Option<String>,
+    /// Settlement status reported by the receipt, such as `success`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_status: Option<String>,
 }
 
 /// Discovered local inference provider, broadcast to UIs on (re)probe.
@@ -195,11 +262,17 @@ pub struct PaymentFlow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
     pub resource: String,
+    /// HTTP method used for the proxied request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     pub status: FlowStatus,
     pub client_ip: String,
     pub started_at: String,
     pub updated_at: String,
     pub duration_ms: u64,
+    /// Final upstream HTTP status, or the latest handshake status in progress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<String>,
     pub steps: Vec<FlowStep>,
@@ -211,7 +284,12 @@ pub struct PaymentFlow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<PaymentDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payment_headers: Option<HashMap<String, String>>,
+    /// Captured request payload, truncated by the proxy and with common secret fields redacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,6 +392,8 @@ pub struct LogEntry {
     pub status: u16,
     pub ms: u64,
     pub req_headers: HashMap<String, String>,
+    /// Optional request payload captured by a debugger-aware proxy.
+    pub req_body: Option<String>,
     pub res_headers: HashMap<String, String>,
     pub res_body: Option<String>,
     pub client_ip: String,
@@ -373,6 +453,10 @@ mod tests {
             streamed: true,
             tokens_prompt: Some(12),
             tokens_completion: Some(214),
+            tokens_cached: Some(4),
+            tokens_reasoning: Some(8),
+            response_id: Some("chatcmpl-123".into()),
+            finish_reason: Some("stop".into()),
             ttft_ms: Some(182),
             tokens_per_sec: Some(41.2),
         };
@@ -381,6 +465,10 @@ mod tests {
         assert_eq!(json["endpointKind"], "chat");
         assert_eq!(json["tokensPrompt"], 12);
         assert_eq!(json["tokensCompletion"], 214);
+        assert_eq!(json["tokensCached"], 4);
+        assert_eq!(json["tokensReasoning"], 8);
+        assert_eq!(json["responseId"], "chatcmpl-123");
+        assert_eq!(json["finishReason"], "stop");
         assert_eq!(json["ttftMs"], 182);
         assert_eq!(json["tokensPerSec"], 41.2);
         // Empty optionals are omitted, not null.
