@@ -94,5 +94,29 @@ describe('parseURL', () => {
 
             expect(() => parseURL(url)).toThrow('reference invalid');
         });
+
+        it.each(['amount', 'spl-token', 'label', 'message', 'memo'])(
+            'throws an error on duplicate %s',
+            field => {
+                const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?${field}=1&${field}=2`;
+
+                expect(() => parseURL(url)).toThrow(`${field} invalid`);
+            },
+        );
+
+        it('accepts repeated reference fields', () => {
+            const url =
+                'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?reference=82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny&reference=mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN';
+
+            const { reference } = parseURL(url) as TransferRequestURL;
+
+            expect(reference).toHaveLength(2);
+        });
+
+        it('throws an error on duplicate transaction-request label', () => {
+            const url = 'solana:https://example.com/solana-pay?label=A&label=B';
+
+            expect(() => parseURL(url)).toThrow('label invalid');
+        });
     });
 });
