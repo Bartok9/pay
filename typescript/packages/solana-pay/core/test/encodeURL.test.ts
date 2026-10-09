@@ -96,6 +96,7 @@ describe('encodeURL', () => {
             const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
 
             expect(() => encodeURL({ recipient, amount: Infinity })).toThrow('amount invalid');
+            expect(() => encodeURL({ recipient, amount: -1 })).toThrow('amount invalid');
         });
     });
 
