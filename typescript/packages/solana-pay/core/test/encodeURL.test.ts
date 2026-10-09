@@ -91,6 +91,12 @@ describe('encodeURL', () => {
 
             expect(String(url)).toBe(`solana:${recipient}?amount=100&memo=${memo}`);
         });
+
+        it('throws an error on a non-finite amount', () => {
+            const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
+
+            expect(() => encodeURL({ recipient, amount: Infinity })).toThrow('amount invalid');
+        });
     });
 
     describe('TransactionRequestURL', () => {
