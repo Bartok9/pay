@@ -16,8 +16,12 @@
 //! Server records channel state; the client signs vouchers for that channel
 //! ```
 //!
+use pay_kit::core::payment_channel::payer_refund::{
+    DistributeClearance, ObservedAccount, PayerRefund,
+};
 use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineError};
 use pay_kit::mpp::blockhash::BlockhashCache;
+use pay_kit::mpp::program::payment_channels::generated::generated::types::ChannelStatus;
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionOpenContext, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
 use pay_kit::mpp::solana_keychain::TransactionSigner;
@@ -26,8 +30,7 @@ use pay_kit::mpp::store::{
 };
 use pay_kit::mpp::{
     Base64UrlJson, ChallengeEcho, PaymentChallenge, SessionAction, SessionRequest,
-    SessionVoucherSigner, SignedVoucher, UsePayload, VoucherData, VoucherPayload,
-    VoucherSignatureType, parse_authorization,
+    SessionVoucherSigner, UsePayload, parse_authorization,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -202,6 +205,11 @@ pub enum SessionOutcome {
         /// other variant would otherwise be moved around at its size.
         state: Box<ChannelState>,
         signature: Option<String>,
+        /// The request's authentication under an operator-signed session: a
+        /// `use` proof, or the proof an `open` bound. `None` for a client-signed
+        /// session and for a `topUp`, which authenticates no request. Only a
+        /// request carrying one can be charged.
+        delegated: Option<Arc<DelegatedUse>>,
     },
     /// `voucher` accepted — channel id + new settled cumulative (base units).
     Voucher {
@@ -226,6 +234,100 @@ pub struct DelegatedUsageAuthorization {
     pub idle_timeout_seconds: u32,
 }
 
+/// A request authenticated under an operator-signed session, the only thing
+/// a delegated charge takes (draft-solana-session-00 §Debit Processing: the
+/// request is authenticated before it is charged).
+///
+/// [`SessionMpp`] creates one only after PayKit accepted the request's proof
+/// (`authenticate_use`). The request is one record in PayKit under its own
+/// idempotency key, charged up to its running total: each charge asks for
+/// what the request has been charged so far plus the new usage, so a retry
+/// of a charge after an ambiguous store result replays instead of charging
+/// twice, and a stream of charges stays one record rather than one per
+/// chunk. A request's charges run one at a time. The key is generated per
+/// admitted request, never taken from the client: a client retry is a new
+/// request and is served (and charged) again.
+pub struct DelegatedUse {
+    payload: UsePayload,
+    challenge_id: String,
+    request_key: String,
+    /// What PayKit has charged this request so far.
+    charged: std::sync::atomic::AtomicU64,
+}
+
+impl DelegatedUse {
+    /// The authenticated channel.
+    pub fn channel_id(&self) -> &str {
+        &self.payload.channel_id
+    }
+
+    /// The request's total once `amount` more is charged.
+    fn total_with(&self, amount: u64) -> Result<u64> {
+        self.charged
+            .load(Ordering::SeqCst)
+            .checked_add(amount)
+            .ok_or_else(|| Error::Mpp("delegated request total overflow".to_string()))
+    }
+}
+
+#[cfg(test)]
+impl DelegatedUse {
+    /// Test support: bind `channel_id`'s stored record to a fixed test
+    /// payer's proof (deterministic, so binding twice keeps the first proof)
+    /// and return an authenticated request for it. The charge still runs
+    /// PayKit's `authenticate_use` against the stored binding.
+    pub(crate) async fn for_test(session: &SessionMpp, channel_id: &str) -> Arc<Self> {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let store = &session.operator_runtime.channel_store;
+        let state = store
+            .get_channel(channel_id)
+            .await
+            .unwrap()
+            .expect("seed the channel before authenticating a request on it");
+        let opening = if state.opening_challenge_id.is_empty() {
+            "test-opening".to_string()
+        } else {
+            state.opening_challenge_id.clone()
+        };
+        let proof =
+            pay_kit::mpp::SessionAuthentication::sign(opening.clone(), channel_id, &key).unwrap();
+        let bound = serde_json::to_string(&proof).unwrap();
+        let payer = proof.payer.clone();
+        store
+            .update_channel(
+                channel_id,
+                Box::new(move |state| {
+                    let mut state = state.expect("seeded channel");
+                    state.payer = payer;
+                    state.authentication = Some(bound);
+                    state.opening_challenge_id = opening;
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        Arc::new(Self {
+            payload: UsePayload {
+                channel_id: channel_id.to_string(),
+                authentication: proof,
+            },
+            challenge_id: "test-request".to_string(),
+            request_key: format!("test-{}", uuid::Uuid::new_v4().simple()),
+            charged: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+impl std::fmt::Debug for DelegatedUse {
+    // The proof is a bearer credential: never format it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegatedUse")
+            .field("channel_id", &self.payload.channel_id)
+            .field("request_key", &self.request_key)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 struct SessionOperatorRuntime {
     server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
@@ -246,6 +348,9 @@ struct SessionOperatorRuntime {
     /// Batched settlement worker, spawned lazily on first close (the signer is
     /// set after construction). Concurrent closes pack into shared txs.
     settlement_worker: Arc<tokio::sync::OnceCell<SettlementHandle>>,
+    /// Wakes the lifecycle runloop when a close defers its payout, so the
+    /// retry runs even with automatic close disabled.
+    payout_deferred: Arc<tokio::sync::Notify>,
 }
 
 impl SessionOperatorRuntime {
@@ -475,15 +580,19 @@ impl SessionOperatorRuntime {
             }
             Err(error) => return Err(error),
         };
-        if let Some(signature) = signature {
-            self.server
-                .mark_sealed(&params.channel_id.to_string())
-                .await
-                .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
+        if let Some(settlement) = signature {
+            self.finish_close(&params.channel_id.to_string(), &settlement)
+                .await?;
             // Retain the settle signature so `/sessions/receipt/:channelId` can
             // surface the on-chain receipt URL (sessions settle out-of-band).
-            self.record_settlement_signature(params.channel_id.to_string(), signature.clone());
-            telemetry::record_payment_channel_closed(&signature, &params.channel_id.to_string());
+            self.record_settlement_signature(
+                params.channel_id.to_string(),
+                settlement.signature.clone(),
+            );
+            telemetry::record_payment_channel_closed(
+                &settlement.signature,
+                &params.channel_id.to_string(),
+            );
         }
 
         Ok(SessionCloseResult::Closed {
@@ -517,6 +626,14 @@ impl SessionOperatorRuntime {
     ) -> Result<
         Option<pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel>,
     > {
+        self.fetch_payment_channel_account(channel_id)
+            .await?
+            .map(|data| self.decode_payment_channel(&data))
+            .transpose()
+    }
+
+    /// The raw payment-channel account, `None` without an RPC or when absent.
+    async fn fetch_payment_channel_account(&self, channel_id: &str) -> Result<Option<Vec<u8>>> {
         if self.rpc_url.is_none() {
             return Ok(None);
         }
@@ -530,20 +647,121 @@ impl SessionOperatorRuntime {
         pipeline
             .read_owned_account_data(channel, None, deployment.program_id)
             .await
-            .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))?
-            .map(|data| {
-                deployment
-                    .decode_channel(&data)
-                    .map(|state| state.channel)
-                    .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
-            })
-            .transpose()
+            .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))
+    }
+
+    fn decode_payment_channel(
+        &self,
+        data: &[u8],
+    ) -> Result<pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel>
+    {
+        self.config
+            .channel_deployment()
+            .map_err(|error| Error::Mpp(format!("invalid channel deployment: {error}")))?
+            .decode_channel(data)
+            .map(|state| state.channel)
+            .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
+    }
+
+    /// Whether this close may also `distribute`. The program forfeits a due
+    /// refund to the treasury when the payer's token account cannot take it,
+    /// so the kit clears the distribute only once that account is payable, or
+    /// once the channel has been sealed for its grace period. A deferred
+    /// close lands only the settle-and-seal; the settlement worker
+    /// distributes the sealed channel on a later pass.
+    async fn distribute_clearance(
+        &self,
+        pipeline: &TxPipeline,
+        params: &SealParams,
+        channel_account: &[u8],
+        token_program: &solana_pubkey::Pubkey,
+    ) -> Result<Option<DistributeClearance>> {
+        let refund_account = params
+            .payer_refund_account(token_program)
+            .map_err(|error| Error::Mpp(format!("payer refund account: {error}")))?;
+        let refund_data = match pipeline
+            .read_owned_account_data(refund_account, None, *token_program)
+            .await
+        {
+            Ok(data) => Some(data),
+            // Held by another program: the kit reports it unpayable.
+            Err(TxPipelineError::AccountOwnerMismatch { .. }) => None,
+            Err(error) => {
+                return Err(Error::Mpp(format!(
+                    "failed to fetch payer refund account: {error}"
+                )));
+            }
+        };
+        let foreign_owner = solana_pubkey::Pubkey::default();
+        let observed = match &refund_data {
+            Some(Some(data)) => Some(ObservedAccount {
+                owner: *token_program,
+                data,
+            }),
+            Some(None) => None,
+            None => Some(ObservedAccount {
+                owner: foreign_owner,
+                data: &[],
+            }),
+        };
+        let channel_id = params.channel_id.to_string();
+        let stored = self
+            .channel_store
+            .get_channel(&channel_id)
+            .await
+            .map_err(|error| Error::Mpp(format!("failed to read seal time: {error}")))?;
+        let sealed_at = match stored.as_ref().and_then(distribution_deferred_at) {
+            Some(deferred_at) => Some(deferred_at),
+            None => self
+                .server
+                .sealed_at(&channel_id)
+                .await
+                .map_err(|error| Error::Mpp(format!("failed to read seal time: {error}")))?,
+        };
+        let now = i64::try_from(unix_millis() / 1_000).unwrap_or(i64::MAX);
+        let decision = params
+            .payer_refund(channel_account, token_program, observed, sealed_at, now)
+            .map_err(|error| Error::Mpp(format!("payer refund check: {error}")))?;
+        Ok(match decision {
+            PayerRefund::Clear(clearance) => Some(clearance),
+            PayerRefund::Forfeit {
+                clearance,
+                refund,
+                payer_token_account,
+                reason,
+            } => {
+                tracing::warn!(
+                    channel_id,
+                    refund,
+                    %payer_token_account,
+                    reason,
+                    "payer refund account stayed unpayable past the grace period; distributing anyway"
+                );
+                Some(clearance)
+            }
+            PayerRefund::Deferred {
+                refund,
+                payer_token_account,
+                reason,
+                until,
+            } => {
+                tracing::warn!(
+                    channel_id,
+                    refund,
+                    %payer_token_account,
+                    reason,
+                    until,
+                    "payer refund account cannot take the refund; sealing without distributing"
+                );
+                None
+            }
+        })
     }
 
     async fn submit_payment_channel_settlement(
         &self,
         params: &SealParams,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<CloseSettlement>> {
         // `settle_and_finalize` requires the **merchant** (recipient) to sign,
         // and for client-voucher pull the recipient is pinned to the settlement
         // signer — so the worker must sign with that. The channel's `rent_payer`
@@ -571,7 +789,11 @@ impl SessionOperatorRuntime {
         // fails with VoucherWatermarkNotMonotonic (0xEA). When chain already
         // has the latest accepted watermark, seal it without another voucher.
         let channel_id = params.channel_id.to_string();
-        let onchain = self.fetch_payment_channel(&channel_id).await?;
+        let channel_account = self.fetch_payment_channel_account(&channel_id).await?;
+        let onchain = channel_account
+            .as_deref()
+            .map(|data| self.decode_payment_channel(data))
+            .transpose()?;
         let onchain_settled = onchain
             .as_ref()
             .map(|channel| channel.settlement.settled)
@@ -593,6 +815,11 @@ impl SessionOperatorRuntime {
                 ));
             }
         };
+        let channel_account = channel_account
+            .ok_or_else(|| Error::Mpp(format!("payment channel {channel_id} is not on chain")))?;
+        let clearance = self
+            .distribute_clearance(&tx_pipeline, params, &channel_account, &token_program)
+            .await?;
         let instructions = close_instructions(
             params,
             &authorized_signer,
@@ -600,10 +827,27 @@ impl SessionOperatorRuntime {
             rent_payer,
             &treasury,
             &token_program,
+            clearance.as_ref(),
         )?;
+        let signature = self
+            .settle_and_confirm(signer, tx_pipeline, channel_id, instructions)
+            .await?;
+        Ok(Some(CloseSettlement {
+            signature,
+            distributed: clearance.is_some(),
+        }))
+    }
 
-        // Route through the shared batched worker: concurrent closes pack into
-        // shared transactions, signed once by the operator and broadcast.
+    /// Land `instructions` through the shared batched settlement worker and
+    /// wait for confirmation: concurrent closes pack into shared
+    /// transactions, signed once by the operator and broadcast.
+    async fn settle_and_confirm(
+        &self,
+        signer: Arc<dyn TransactionSigner>,
+        tx_pipeline: TxPipeline,
+        channel_id: String,
+        instructions: Vec<solana_instruction::Instruction>,
+    ) -> Result<String> {
         let operator = signer.pubkey();
         let handle = self
             .settlement_worker
@@ -639,8 +883,131 @@ impl SessionOperatorRuntime {
                 )));
             }
         }
-        Ok(Some(signature))
+        Ok(signature)
     }
+
+    /// Record a confirmed close. A close that also distributed finishes the
+    /// channel. One whose distribute was deferred leaves the record open to
+    /// the lifecycle, which retries the payout (see
+    /// [`Self::distribute_deferred`]): marking it sealed would drop it from
+    /// every later pass, and a durable store expires sealed records.
+    async fn finish_close(&self, channel_id: &str, settlement: &CloseSettlement) -> Result<()> {
+        if settlement.distributed {
+            return self
+                .server
+                .mark_sealed(channel_id)
+                .await
+                .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")));
+        }
+        let sealed_at = unix_millis() / 1_000;
+        self.channel_store
+            .update_channel(
+                channel_id,
+                Box::new(move |state| {
+                    let mut state = state
+                        .ok_or_else(|| StoreError::Internal("Channel not found".to_string()))?;
+                    state
+                        .extra
+                        .entry(DISTRIBUTION_DEFERRED_AT_KEY.to_string())
+                        .or_insert_with(|| sealed_at.into());
+                    Ok(state)
+                }),
+            )
+            .await
+            .map_err(|e| Error::Mpp(format!("Failed to record the deferred payout: {e}")))?;
+        self.payout_deferred.notify_one();
+        Ok(())
+    }
+
+    /// Retry the payout of a channel a close sealed without distributing.
+    /// Returns whether the channel is finished: distributed now, already
+    /// distributed or reclaimed onchain. A refund account that still cannot
+    /// take the refund keeps it pending until the kit's deadline, after which
+    /// the distribute runs anyway.
+    async fn distribute_deferred(&self, channel_id: &str) -> Result<bool> {
+        let Some(signer) = self.payment_channel_signer() else {
+            return Ok(false);
+        };
+        let finished = match self.fetch_payment_channel_account(channel_id).await? {
+            // Reclaimed or tombstoned: nothing is left to pay out.
+            None => true,
+            Some(data) if data.as_slice() == [2] => true,
+            Some(data) => {
+                let channel = self.decode_payment_channel(&data)?;
+                if channel.status == ChannelStatus::Distributed as u8 {
+                    true
+                } else if channel.status != ChannelStatus::Sealed as u8 {
+                    return Ok(false);
+                } else {
+                    let params = self
+                        .server
+                        .seal_params(channel_id)
+                        .await
+                        .map_err(|e| Error::Mpp(format!("Failed to get seal params: {e}")))?;
+                    let token_program = solana_pubkey::Pubkey::from_str(&self.token_program)
+                        .map_err(|error| {
+                            Error::Mpp(format!(
+                                "invalid payment-channel token program {}: {error}",
+                                self.token_program
+                            ))
+                        })?;
+                    let tx_pipeline = self.transaction_pipeline().await?;
+                    let Some(clearance) = self
+                        .distribute_clearance(&tx_pipeline, &params, &data, &token_program)
+                        .await?
+                    else {
+                        return Ok(false);
+                    };
+                    let rent_payer = close_rent_payer(
+                        params.rent_payer,
+                        Some(solana_pubkey::Pubkey::from(channel.rent_payer.to_bytes())),
+                    )?;
+                    let treasury = payment_channel_treasury_owner(&self.network)?;
+                    let distribute = SealParams {
+                        rent_payer: Some(rent_payer),
+                        ..params
+                    }
+                    .distribute_instruction(&treasury, &token_program, &clearance)
+                    .map_err(|error| {
+                        Error::Mpp(format!("failed to build distribution: {error}"))
+                    })?;
+                    let signature = self
+                        .settle_and_confirm(
+                            signer,
+                            tx_pipeline,
+                            channel_id.to_string(),
+                            vec![distribute],
+                        )
+                        .await?;
+                    self.record_settlement_signature(channel_id.to_string(), signature);
+                    true
+                }
+            }
+        };
+        if finished {
+            self.server
+                .mark_sealed(channel_id)
+                .await
+                .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
+        }
+        Ok(finished)
+    }
+}
+
+/// A confirmed close: its transaction, and whether it also distributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseSettlement {
+    pub signature: String,
+    pub distributed: bool,
+}
+
+/// Where a record keeps when its close sealed the channel without paying it
+/// out (unix seconds), inside [`ChannelState::extra`]. Its presence is what
+/// the lifecycle retries the distribute for.
+const DISTRIBUTION_DEFERRED_AT_KEY: &str = "payDistributionDeferredAt";
+
+fn distribution_deferred_at(state: &ChannelState) -> Option<i64> {
+    state.extra.get(DISTRIBUTION_DEFERRED_AT_KEY)?.as_i64()
 }
 
 /// Message version for operator settlement transactions, from the same
@@ -690,7 +1057,8 @@ fn require_open_onchain(rpc_configured: bool, status: Option<u8>) -> Result<()> 
     }
 }
 
-/// The atomic settle-and-seal plus distribute instructions closing a channel.
+/// The atomic settle-and-seal closing a channel, plus its distribute when
+/// `clearance` allows it ([`SessionOperatorRuntime::distribute_clearance`]).
 fn close_instructions(
     params: &SealParams,
     authorized_signer: &solana_pubkey::Pubkey,
@@ -698,6 +1066,7 @@ fn close_instructions(
     rent_payer: solana_pubkey::Pubkey,
     treasury: &solana_pubkey::Pubkey,
     token_program: &solana_pubkey::Pubkey,
+    clearance: Option<&DistributeClearance>,
 ) -> Result<Vec<solana_instruction::Instruction>> {
     let mut instructions =
         pay_kit::mpp::program::payment_channels::build_settle_and_seal_instructions(
@@ -710,13 +1079,16 @@ fn close_instructions(
             &params.program_id,
         )
         .map_err(|e| Error::Mpp(format!("failed to build settlement instruction: {e}")))?;
+    let Some(clearance) = clearance else {
+        return Ok(instructions);
+    };
     let distribution = SealParams {
         rent_payer: Some(rent_payer),
         ..params.clone()
     };
     instructions.push(
         distribution
-            .distribute_instruction(treasury, token_program)
+            .distribute_instruction(treasury, token_program, clearance)
             .map_err(|error| Error::Mpp(format!("failed to build distribution: {error}")))?,
     );
     Ok(instructions)
@@ -947,6 +1319,8 @@ struct SessionLifecycleRunloop {
     /// Rotating offset into the active-channel set for the per-cycle settlement
     /// cap, so successive cycles cover different channels (bounded settle age).
     settlement_cursor: usize,
+    /// Whether a deferred payout may still be waiting for its retry.
+    deferred_payouts_pending: bool,
 }
 
 impl SessionLifecycleRunloop {
@@ -964,6 +1338,7 @@ impl SessionLifecycleRunloop {
             reconciliation: SessionLifecycleReconciliation::Embedded,
             rx,
             settlement_cursor: 0,
+            deferred_payouts_pending: false,
         }
     }
 
@@ -972,6 +1347,7 @@ impl SessionLifecycleRunloop {
         loop {
             if let Some((delay, close_due)) = self.next_wakeup() {
                 if accepting_commands {
+                    let payout_deferred = Arc::clone(&self.runtime.payout_deferred);
                     tokio::select! {
                         command = self.rx.recv() => {
                             if command.is_some() {
@@ -982,6 +1358,9 @@ impl SessionLifecycleRunloop {
                                     break;
                                 }
                             }
+                        }
+                        _ = payout_deferred.notified() => {
+                            self.deferred_payouts_pending = true;
                         }
                         _ = tokio::time::sleep(delay) => {
                             self.run_due_work(close_due).await;
@@ -995,11 +1374,18 @@ impl SessionLifecycleRunloop {
                     }
                 }
             } else if accepting_commands {
-                let command = self.rx.recv().await;
-                if command.is_some() {
-                    self.handle_command(command).await;
-                } else {
-                    break;
+                let payout_deferred = Arc::clone(&self.runtime.payout_deferred);
+                tokio::select! {
+                    command = self.rx.recv() => {
+                        if command.is_some() {
+                            self.handle_command(command).await;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ = payout_deferred.notified() => {
+                        self.deferred_payouts_pending = true;
+                    }
                 }
             } else {
                 break;
@@ -1010,6 +1396,9 @@ impl SessionLifecycleRunloop {
     async fn run_due_work(&mut self, close_due: bool) {
         if close_due && self.reconciliation == SessionLifecycleReconciliation::Embedded {
             self.reconcile_persisted_ownership().await;
+            if self.deferred_payouts_pending {
+                self.retry_deferred_payouts().await;
+            }
             self.close_due_channels().await;
         }
         self.push_due_watermarks().await;
@@ -1041,6 +1430,9 @@ impl SessionLifecycleRunloop {
                 self.reconciliation = reconciliation;
                 if reconciliation == SessionLifecycleReconciliation::Embedded {
                     self.reconcile_persisted_ownership().await;
+                    // A persistent store may hold payouts deferred before a
+                    // restart; the first pass looks for them.
+                    self.deferred_payouts_pending = true;
                 }
             }
             Some(SessionLifecycleCommand::Touch {
@@ -1229,7 +1621,7 @@ impl SessionLifecycleRunloop {
 
     fn next_wakeup(&self) -> Option<(Duration, bool)> {
         let close = if self.reconciliation == SessionLifecycleReconciliation::Embedded
-            && self.close_delay.is_some()
+            && (self.close_delay.is_some() || self.deferred_payouts_pending)
         {
             Some(duration_until_next_boundary(self.close_batch_interval))
         } else {
@@ -1239,6 +1631,111 @@ impl SessionLifecycleRunloop {
             .next_settlement
             .map(|deadline| deadline.saturating_duration_since(Instant::now()));
         next_lifecycle_wakeup(close, settlement)
+    }
+
+    /// Retry the payouts closes deferred because the payer's refund account
+    /// could not take the refund. Nothing else distributes them in embedded
+    /// mode (an in-memory store has no external worker), so every pass tries
+    /// again until they land, whether or not automatic close is enabled.
+    async fn retry_deferred_payouts(&mut self) {
+        let states = match self.runtime.channel_store.list_channels().await {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!(%error, "failed to enumerate deferred payment-channel payouts");
+                return;
+            }
+        };
+        let deferred = states
+            .into_iter()
+            .filter(|state| !state.sealed && distribution_deferred_at(state).is_some())
+            .map(|state| state.channel_id)
+            .collect::<Vec<_>>();
+        if deferred.is_empty() {
+            self.deferred_payouts_pending = false;
+            return;
+        }
+        let mut claimed = Vec::with_capacity(deferred.len());
+        for channel_id in deferred {
+            if self.claim_deferred_payout(&channel_id).await {
+                claimed.push(channel_id);
+            }
+        }
+        self.distribute_deferred_channels(claimed).await;
+    }
+
+    /// Lease a deferred payout to this runloop, so one replica retries it.
+    /// A record without a lifecycle (automatic close disabled) or with an
+    /// expired lease is taken over; an active lease of another gateway is not.
+    async fn claim_deferred_payout(&self, channel_id: &str) -> bool {
+        let now_ms = unix_millis();
+        let owner_id = self.owner.clone();
+        let leased_owner = self.leased_owner(now_ms);
+        let claimed = Arc::new(AtomicBool::new(false));
+        let claim = Arc::clone(&claimed);
+        let result = self
+            .runtime
+            .channel_store
+            .update_channel(
+                channel_id,
+                Box::new(move |current| {
+                    let mut current =
+                        current.ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                    claim.store(false, Ordering::Release);
+                    if current.sealed || distribution_deferred_at(&current).is_none() {
+                        return Ok(current);
+                    }
+                    let claimable = current.lifecycle.as_ref().is_none_or(|lifecycle| {
+                        parse_lifecycle_owner_lease(&lifecycle.owner).is_none_or(
+                            |(current_owner, expires_at_ms)| {
+                                current_owner == owner_id || expires_at_ms <= now_ms
+                            },
+                        )
+                    });
+                    if claimable {
+                        let close_after = current
+                            .lifecycle
+                            .as_ref()
+                            .map_or(now_ms, |lifecycle| lifecycle.close_after);
+                        current.lifecycle = Some(ChannelLifecycle {
+                            owner: leased_owner,
+                            close_after,
+                        });
+                        claim.store(true, Ordering::Release);
+                    }
+                    Ok(current)
+                }),
+            )
+            .await;
+        match result {
+            Ok(_) => claimed.load(Ordering::Acquire),
+            Err(error) => {
+                tracing::debug!(channel_id, %error, "deferred payout lease changed; retrying next pass");
+                false
+            }
+        }
+    }
+
+    async fn distribute_deferred_channels(&self, channel_ids: Vec<String>) {
+        let retries = channel_ids.into_iter().map(|channel_id| {
+            let runtime = self.runtime.clone();
+            async move {
+                let result = runtime.distribute_deferred(&channel_id).await;
+                (channel_id, result)
+            }
+        });
+        for (channel_id, result) in futures_util::future::join_all(retries).await {
+            match result {
+                Ok(true) => {
+                    tracing::info!(channel_id, "distributed a deferred payment-channel payout")
+                }
+                Ok(false) => tracing::debug!(channel_id, "payment-channel payout still deferred"),
+                Err(error) => tracing::warn!(
+                    channel_id,
+                    error = %error,
+                    "deferred payment-channel payout failed; retrying next pass"
+                ),
+            }
+        }
     }
 
     async fn close_due_channels(&mut self) {
@@ -1255,6 +1752,8 @@ impl SessionLifecycleRunloop {
         };
         let due = states
             .into_iter()
+            // Already sealed onchain; the payout retry finishes these.
+            .filter(|state| distribution_deferred_at(state).is_none())
             .filter(|state| !state.sealed && state.close_requested_at.is_none())
             .filter_map(|state| {
                 let owned = state
@@ -1685,6 +2184,7 @@ impl SessionMpp {
             delegated_voucher_lock,
             settlement_signatures: Arc::clone(&settlement_signatures),
             settlement_worker: Arc::new(tokio::sync::OnceCell::new()),
+            payout_deferred: Arc::new(tokio::sync::Notify::new()),
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let runloop = SessionLifecycleRunloop::new(operator_runtime.clone(), rx);
@@ -2043,23 +2543,21 @@ impl SessionMpp {
     /// voucher before releasing that response to the client.
     pub async fn authorize_delegated_usage(
         &self,
-        channel_id: &str,
+        delegated: &DelegatedUse,
         amount: u64,
     ) -> Result<DelegatedUsageAuthorization> {
-        self.authorize_reserved_usage(channel_id, amount, None)
-            .await
+        self.authorize_reserved_usage(delegated, amount, None).await
     }
 
     pub async fn authorize_reserved_usage(
         &self,
-        channel_id: &str,
+        delegated: &DelegatedUse,
         amount: u64,
         lease: Option<&DelegatedCapacityLease>,
     ) -> Result<DelegatedUsageAuthorization> {
-        let accepted = self
-            .commit_reserved_usage(channel_id, amount, lease)
+        let accepted = self.commit_reserved_usage(delegated, amount, lease).await?;
+        self.touch_after_delegated_usage(delegated.channel_id())
             .await?;
-        self.touch_after_delegated_usage(channel_id).await?;
         Ok(accepted)
     }
 
@@ -2070,10 +2568,10 @@ impl SessionMpp {
     /// is cancelled, uses the two halves.
     pub async fn commit_delegated_usage(
         &self,
-        channel_id: &str,
+        delegated: &DelegatedUse,
         amount: u64,
     ) -> Result<DelegatedUsageAuthorization> {
-        self.commit_reserved_usage(channel_id, amount, None).await
+        self.commit_reserved_usage(delegated, amount, None).await
     }
 
     /// Extend the channel lifecycle after a committed delegated charge.
@@ -2088,10 +2586,11 @@ impl SessionMpp {
 
     async fn commit_reserved_usage(
         &self,
-        channel_id: &str,
+        delegated: &DelegatedUse,
         amount: u64,
         lease: Option<&DelegatedCapacityLease>,
     ) -> Result<DelegatedUsageAuthorization> {
+        let channel_id = delegated.channel_id();
         let lease_id = lease.and_then(|lease| lease.durable_id.clone());
         if self.channel_binding.is_some() && lease_id.is_none() {
             return Err(Error::PaymentRejected(
@@ -2118,9 +2617,11 @@ impl SessionMpp {
                 "session does not delegate voucher authority to the operator".to_string(),
             ));
         }
-        // Serialize read/sign/verify so concurrent responses cannot construct
-        // two vouchers from the same cumulative watermark.
+        // Serialize charges on this replica so concurrent responses rarely
+        // race; PayKit fences each commit on the watermark it signed from and
+        // retries a lost race, which is what keeps other replicas correct.
         let _guard = self.operator_runtime.delegated_voucher_lock.lock().await;
+
         // The durable store is authoritative. Reading it on every delegated
         // authorization also lets a restarted or different gateway replica
         // continue from a watermark advanced by another process.
@@ -2140,22 +2641,20 @@ impl SessionMpp {
         self.server
             .require_channel_binding(&state)
             .map_err(|error| Error::PaymentRejected(error.to_string()))?;
-        let current = state.cumulative;
         let idle_timeout_seconds = state.idle_timeout_seconds.ok_or_else(|| {
             Error::Mpp(format!(
                 "delegated session channel {channel_id} is missing its negotiated idle timeout"
             ))
         })?;
-        self.record_committed_watermark(channel_id.to_string(), current);
+        self.record_committed_watermark(channel_id.to_string(), state.cumulative);
         if amount == 0 {
+            // Nothing delivered is nothing charged: unused reserved capacity
+            // MUST NOT advance the voucher.
             return Ok(DelegatedUsageAuthorization {
-                cumulative: current,
+                cumulative: state.cumulative,
                 idle_timeout_seconds,
             });
         }
-        let cumulative = current
-            .checked_add(amount)
-            .ok_or_else(|| Error::Mpp("session cumulative amount overflow".to_string()))?;
         let signer = self
             .operator_runtime
             .payment_channel_signer()
@@ -2169,31 +2668,38 @@ impl SessionMpp {
             )));
         }
 
-        let data = VoucherData {
-            channel_id: channel_id.to_string(),
-            cumulative_amount: cumulative.to_string(),
-            expires_at: Some(pay_kit::mpp::DEFAULT_SESSION_EXPIRES_AT),
-        };
-        let message = data
-            .message_bytes()
-            .map_err(|e| Error::Mpp(format!("failed to encode delegated voucher: {e}")))?;
-        let signature = signer
-            .sign_message(&message)
-            .await
-            .map_err(|e| Error::Mpp(format!("failed to sign delegated voucher: {e}")))?;
-        let accepted = self
+        let authenticated = self
             .server
-            .verify_voucher_with_guard(
-                &VoucherPayload {
-                    channel_id: channel_id.to_string(),
-                    voucher: SignedVoucher {
-                        data,
-                        signer: operator.to_string(),
-                        signature: crate::b58::encode_64(&<[u8; 64]>::from(signature)),
-                        signature_type: VoucherSignatureType::Ed25519,
-                    },
-                },
+            .authenticate_use(
+                &delegated.payload,
+                &delegated.challenge_id,
+                &delegated.request_key,
+            )
+            .await
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        let request_total = delegated.total_with(amount)?;
+        let charged_before = request_total - amount;
+        let request_key = delegated.request_key.clone();
+        let charge = self
+            .server
+            .charge_operator_request(
+                &authenticated,
+                signer.as_ref(),
+                request_total,
                 move |state| {
+                    // PayKit keeps only the latest requests' records. Once this
+                    // request's record is evicted, PayKit would charge its
+                    // whole running total again; refuse instead.
+                    if charged_before > 0
+                        && !state
+                            .processed_uses
+                            .iter()
+                            .any(|recorded| recorded.idempotency_key == request_key)
+                    {
+                        return Err(pay_kit::mpp::Error::Other(
+                            "the request's charge record was evicted".into(),
+                        ));
+                    }
                     if let Some(id) = &lease_id {
                         if initial_cumulative != Some(state.cumulative) {
                             return Err(pay_kit::mpp::Error::Other(
@@ -2218,22 +2724,27 @@ impl SessionMpp {
                 },
             )
             .await
-            .map_err(|e| Error::PaymentRejected(e.to_string()))?;
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        delegated
+            .charged
+            .fetch_max(charge.request_total, Ordering::SeqCst);
         telemetry::record_payment_channel_voucher_cumulative(
             channel_id,
             self.currency(),
             self.network(),
-            accepted.cumulative,
+            charge.cumulative,
         );
-        telemetry::record_payment_channel_voucher_accepted_for_protocol(
-            "mpp/session",
-            self.currency(),
-            self.network(),
-            accepted.charged,
-        );
-        self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
+        if !charge.replay {
+            telemetry::record_payment_channel_voucher_accepted_for_protocol(
+                "mpp/session",
+                self.currency(),
+                self.network(),
+                charge.charged,
+            );
+        }
+        self.record_committed_watermark(channel_id.to_string(), charge.cumulative);
         Ok(DelegatedUsageAuthorization {
-            cumulative: accepted.cumulative,
+            cumulative: charge.cumulative,
             idle_timeout_seconds,
         })
     }
@@ -2511,6 +3022,14 @@ impl SessionMpp {
         credential: &pay_kit::mpp::PaymentCredential,
     ) -> Result<SessionRequest> {
         let echo = &credential.challenge;
+        // The HMAC only proves some server holding this secret minted the
+        // challenge; operators can share a root secret across APIs, so the
+        // echo must also name this backend before anything else is trusted.
+        if echo.realm != self.realm || echo.method.as_str() != METHOD {
+            return Err(Error::Mpp(
+                terminal_errors::CHALLENGE_ECHO_MISMATCH.to_string(),
+            ));
+        }
         if let Some(request) =
             VERIFIED_CHALLENGES.with_borrow(|cache| cache.get(&self.challenge_binding_secret, echo))
         {
@@ -2646,19 +3165,39 @@ impl SessionMpp {
 
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
+                // An operator-signed open authenticates its request with the
+                // proof it binds, the one every later `use` presents.
+                let delegated = match (&p.authentication, self.voucher_signer()) {
+                    (Some(authentication), SessionVoucherSigner::Operator) => Some(
+                        self.authenticate_delegated_use(
+                            UsePayload {
+                                channel_id: state.channel_id.clone(),
+                                authentication: authentication.clone(),
+                            },
+                            &credential.challenge.id,
+                        )
+                        .await?,
+                    ),
+                    _ => None,
+                };
                 Ok(SessionOutcome::Active {
                     state: Box::new(state),
                     signature,
+                    delegated,
                 })
             }
 
             SessionAction::Use(p) => {
                 let state = self.verify_use_authentication(p).await?;
+                let delegated = self
+                    .authenticate_delegated_use(p.clone(), &credential.challenge.id)
+                    .await?;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
                 Ok(SessionOutcome::Active {
                     state: Box::new(state),
                     signature: None,
+                    delegated: Some(delegated),
                 })
             }
 
@@ -2730,6 +3269,7 @@ impl SessionMpp {
                 Ok(SessionOutcome::Active {
                     state: Box::new(state),
                     signature,
+                    delegated: None,
                 })
             }
 
@@ -2789,23 +3329,22 @@ impl SessionMpp {
                     }
                     Err(error) => return Err(error),
                 };
-                if let Some(signature) = signature.as_ref() {
-                    self.server
-                        .mark_sealed(&params.channel_id.to_string())
-                        .await
-                        .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
+                if let Some(settlement) = signature.as_ref() {
+                    self.operator_runtime
+                        .finish_close(&params.channel_id.to_string(), settlement)
+                        .await?;
                     self.operator_runtime.record_settlement_signature(
                         params.channel_id.to_string(),
-                        signature.clone(),
+                        settlement.signature.clone(),
                     );
                     telemetry::record_payment_channel_closed(
-                        signature,
+                        &settlement.signature,
                         &params.channel_id.to_string(),
                     );
                 }
                 Ok(SessionOutcome::Closed {
                     params: Box::new(params),
-                    signature,
+                    signature: signature.map(|settlement| settlement.signature),
                 })
             }
         }
@@ -2956,6 +3495,26 @@ impl SessionMpp {
         Ok(())
     }
 
+    /// Authenticate a delegated request with PayKit (`authenticate_use`) and
+    /// return the token its charges take. See [`DelegatedUse`].
+    pub async fn authenticate_delegated_use(
+        &self,
+        payload: UsePayload,
+        challenge_id: &str,
+    ) -> Result<Arc<DelegatedUse>> {
+        let request_key = format!("pay-{}", uuid::Uuid::new_v4().simple());
+        self.server
+            .authenticate_use(&payload, challenge_id, &request_key)
+            .await
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        Ok(Arc::new(DelegatedUse {
+            payload,
+            challenge_id: challenge_id.to_string(),
+            request_key,
+            charged: std::sync::atomic::AtomicU64::new(0),
+        }))
+    }
+
     async fn verify_use_authentication(&self, payload: &UsePayload) -> Result<ChannelState> {
         if self.voucher_signer() != SessionVoucherSigner::Operator {
             return Err(Error::Mpp(terminal_errors::OPERATOR_ONLY.to_string()));
@@ -3032,7 +3591,7 @@ impl SessionMpp {
     async fn submit_payment_channel_settlement(
         &self,
         params: &SealParams,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<CloseSettlement>> {
         self.operator_runtime
             .submit_payment_channel_settlement(params)
             .await
@@ -3054,7 +3613,7 @@ pub fn test_channel_state(
     authentication: Option<String>,
 ) -> ChannelState {
     let payer = payer.into();
-    ChannelState {
+    let mut state = ChannelState {
         channel_id: channel_id.into(),
         authorized_signer: authorized_signer.into(),
         deposit,
@@ -3085,7 +3644,16 @@ pub fn test_channel_state(
         lifecycle: None,
         schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
         extra: Default::default(),
-    }
+    };
+    // Confirmed open just now, so charges are admitted without a fresh read.
+    state.record_onchain_observation(
+        pay_kit::core::store::OnchainObservation {
+            slot: None,
+            lifecycle: pay_kit::core::store::ObservedLifecycle::Open,
+        },
+        unix_millis() / 1_000,
+    );
+    state
 }
 
 fn payment_channel_treasury_owner(network: &str) -> Result<solana_pubkey::Pubkey> {
@@ -3548,20 +4116,27 @@ mod tests {
         );
         assert!(
             backend
-                .authorize_delegated_usage("durable", 50_000)
+                .authorize_delegated_usage(
+                    &*DelegatedUse::for_test(&backend, "durable").await,
+                    50_000
+                )
                 .await
                 .is_err()
         );
         assert!(
             backend
-                .authorize_reserved_usage("durable", 50_003, Some(&lease))
+                .authorize_reserved_usage(
+                    &*DelegatedUse::for_test(&backend, "durable").await,
+                    50_003,
+                    Some(&lease)
+                )
                 .await
                 .is_err()
         );
     }
 
     #[tokio::test]
-    async fn deployment_only_complete_success_responses_are_charged() {
+    async fn deployment_only_completed_responses_are_charged() {
         use crate::server::gate::{SessionForward, SessionSettlementPlan};
         use axum::{body::Body, response::Response};
         let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
@@ -3578,7 +4153,10 @@ mod tests {
         for (status, content_type, broken, expected_charge) in [
             (200, "application/json", false, 50_000),
             (500, "application/json", false, 0),
-            (302, "application/json", false, 0),
+            // A redirect can follow a completed side effect.
+            (302, "application/json", false, 50_000),
+            (307, "application/json", false, 50_000),
+            (308, "application/json", false, 50_000),
             (200, "text/event-stream", false, 0),
             (200, "application/json", true, 0),
         ] {
@@ -3600,6 +4178,7 @@ mod tests {
                 request_body_bytes: None,
                 payment_policy: None,
                 _reservation: Some(lease),
+                delegated: Some(DelegatedUse::for_test(&backend, &channel).await),
             };
             let body = if broken {
                 Body::from_stream(futures_util::stream::once(async {
@@ -3647,13 +4226,21 @@ mod tests {
             .unwrap()
             .unwrap();
         let accepted = backend
-            .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+            .authorize_reserved_usage(
+                &*DelegatedUse::for_test(&backend, &channel).await,
+                50_000,
+                Some(&lease),
+            )
             .await
             .unwrap();
         assert_eq!(accepted.cumulative, 50_000);
         assert!(
             backend
-                .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+                .authorize_reserved_usage(
+                    &*DelegatedUse::for_test(&backend, &channel).await,
+                    50_000,
+                    Some(&lease)
+                )
                 .await
                 .is_err()
         );
@@ -3705,7 +4292,11 @@ mod tests {
             .unwrap();
         assert!(
             backend
-                .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+                .authorize_reserved_usage(
+                    &*DelegatedUse::for_test(&backend, &channel).await,
+                    50_000,
+                    Some(&lease)
+                )
                 .await
                 .is_err()
         );
@@ -3767,7 +4358,11 @@ mod tests {
         assert!(lease.require_active(50_000).await.is_err());
         assert!(
             backend
-                .authorize_reserved_usage("expiry", 50_000, Some(&lease))
+                .authorize_reserved_usage(
+                    &*DelegatedUse::for_test(&backend, "expiry").await,
+                    50_000,
+                    Some(&lease)
+                )
                 .await
                 .is_err()
         );
@@ -4086,7 +4681,7 @@ mod tests {
         // challenge id no longer matches this server's HMAC.
         let forged = PaymentChallenge::with_challenge_binding_secret(
             "attacker-secret",
-            "test-realm",
+            DEFAULT_REALM,
             METHOD,
             INTENT,
             session.challenge(None).unwrap().request,
@@ -4302,6 +4897,67 @@ mod tests {
         assert!(require_open_onchain(false, None).is_ok());
     }
 
+    /// The clearance for a channel whose deposit is fully settled: no refund
+    /// is due, so its distribute is never deferred.
+    fn fully_settled_clearance(params: &SealParams) -> DistributeClearance {
+        use pay_kit::core::payment_channel::payer_refund::{
+            RefundDeadline, SealedRefundTerms, payer_refund,
+        };
+        let terms = SealedRefundTerms {
+            channel: params.channel_id,
+            payer: params.payer.unwrap(),
+            mint: params.mint.unwrap(),
+            token_program: solana_pubkey::Pubkey::new_unique(),
+            deposit: params.settled,
+            settled: params.settled,
+            payer_withdrawn_at: 0,
+        };
+        let deadline = RefundDeadline {
+            sealed_at: 0,
+            grace_period: 1,
+        };
+        payer_refund(&terms, None, deadline, 0).clearance().unwrap()
+    }
+
+    #[test]
+    fn a_close_without_a_distribute_clearance_only_seals() {
+        let pubkey = |byte: u8| solana_pubkey::Pubkey::new_from_array([byte; 32]);
+        let operator = pubkey(0xAA);
+        let params = SealParams {
+            channel_id: pubkey(0x10),
+            authorized_signer: Some(operator),
+            payer: Some(pubkey(0x20)),
+            rent_payer: Some(pubkey(0x20)),
+            mint: Some(pubkey(0x21)),
+            program_id: pay_kit::core::payment_channels::default_program_id(),
+            channel_version: None,
+            channel_hooks: None,
+            settled: 1_000,
+            voucher_signature: None,
+            voucher_expires_at: None,
+            recipient: operator,
+            splits: Vec::new(),
+            distribution_hash: [0; 32],
+        };
+        let close = |clearance: Option<&DistributeClearance>| {
+            close_instructions(
+                &params,
+                &operator,
+                Some(&[7; 64]),
+                pubkey(0x20),
+                &pubkey(0x22),
+                &pubkey(0x23),
+                clearance,
+            )
+            .unwrap()
+        };
+        let clearance = fully_settled_clearance(&params);
+        let sealed_only = close(None);
+        let distributed = close(Some(&clearance));
+        assert_eq!(distributed.len(), sealed_only.len() + 1);
+        assert_eq!(distributed[..sealed_only.len()], sealed_only[..]);
+    }
+
     #[test]
     fn a_split_heavy_close_settles_only_on_version_one() {
         use pay_kit::core::tx::{TxVersion, build_unsigned_fitting};
@@ -4328,6 +4984,7 @@ mod tests {
                 .collect(),
             distribution_hash: [0; 32],
         };
+        let clearance = fully_settled_clearance(&params);
         let close = close_instructions(
             &params,
             &operator,
@@ -4335,6 +4992,7 @@ mod tests {
             pubkey(0x20),
             &pubkey(0x22),
             &pubkey(0x23),
+            Some(&clearance),
         )
         .unwrap();
         let blockhash = solana_hash::Hash::new_unique();
@@ -4407,6 +5065,64 @@ mod tests {
         // Its own challenge passes the echo check and reaches the payload.
         let error = target
             .process_credential(credential(&target))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Unrecognized session action"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_secret_challenges_stay_in_their_realm() {
+        let backend = |realm: &str| {
+            SessionMpp::new(test_session_config(), "shared-root-secret")
+                .with_realm(realm)
+                .with_blockhash_cache(test_blockhash_cache())
+        };
+        let (api_a, api_b) = (backend("API-A"), backend("API-B"));
+        let credential = |challenge: PaymentChallenge| {
+            PaymentCredential::new(
+                challenge.to_echo(),
+                serde_json::json!({ "action": "mystery" }),
+            )
+        };
+
+        // A's challenge carries a valid HMAC under the shared secret, but
+        // names another realm: B must treat it as foreign.
+        let error = api_b
+            .process_credential(credential(api_a.challenge(None).unwrap()))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(terminal_errors::CHALLENGE_ECHO_MISMATCH),
+            "{error}"
+        );
+
+        // A challenge bound under B's realm but another method is foreign too.
+        let wrong_method = PaymentChallenge::with_challenge_binding_secret(
+            "shared-root-secret",
+            "API-B",
+            "tempo",
+            INTENT,
+            api_b.challenge(None).unwrap().request,
+        );
+        let error = api_b
+            .process_credential(credential(wrong_method))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(terminal_errors::CHALLENGE_ECHO_MISMATCH),
+            "{error}"
+        );
+
+        // B's own challenge passes the echo check and reaches the payload.
+        let error = api_b
+            .process_credential(credential(api_b.challenge(None).unwrap()))
             .await
             .unwrap_err();
         assert!(
@@ -4741,7 +5457,9 @@ mod tests {
         let handle = SessionHandle::new(channel, test_session_signer(), challenge)
             .with_authentication(proof);
 
-        let SessionOutcome::Active { state, signature } = session
+        let SessionOutcome::Active {
+            state, signature, ..
+        } = session
             .process(&handle.use_header().await.unwrap())
             .await
             .unwrap()
@@ -5588,9 +6306,10 @@ mod tests {
         )
         .await;
 
+        let delegated = DelegatedUse::for_test(&session, &channel).await;
         let first = tokio::time::timeout(
             Duration::from_secs(2),
-            session.authorize_delegated_usage(&channel, 75),
+            session.authorize_delegated_usage(&delegated, 75),
         )
         .await
         .expect("first delegated voucher timed out")
@@ -5601,7 +6320,7 @@ mod tests {
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(2),
-                session.authorize_delegated_usage(&channel, 25),
+                session.authorize_delegated_usage(&delegated, 25),
             )
             .await
             .expect("second delegated voucher timed out")
@@ -5621,6 +6340,67 @@ mod tests {
         assert_eq!(session.committed_watermark(&channel), Some(100));
     }
 
+    /// PayKit keeps only the latest requests' charge records. A stream whose
+    /// record another replica's requests evicted must not be charged its
+    /// whole running total again when it resumes.
+    #[tokio::test]
+    async fn a_delegated_request_whose_record_was_evicted_is_not_charged_again() {
+        use pay_kit::mpp::server::session::MAX_PROCESSED_USES;
+
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let operator = signer.pubkey();
+        let mut config = test_session_config();
+        config.operator = operator.to_string();
+        config.voucher_signer = SessionVoucherSigner::Operator;
+        let session = SessionMpp::new(config, "test-secret")
+            .with_blockhash_cache(test_blockhash_cache())
+            .with_payment_channel_signer(Arc::clone(&signer));
+        let challenge = session.challenge(None).unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique().to_string();
+        seed_channel(
+            &session,
+            &channel,
+            CAP,
+            &operator.to_string(),
+            "operator",
+            &challenge.id,
+            &solana_pubkey::Pubkey::new_unique().to_string(),
+            None,
+        )
+        .await;
+
+        let stream = DelegatedUse::for_test(&session, &channel).await;
+        let streamed = session.authorize_delegated_usage(&stream, 100).await;
+        assert_eq!(streamed.unwrap().cumulative, 100);
+        // Positive control: while the record is kept the stream resumes.
+        let resumed = session.authorize_delegated_usage(&stream, 1).await;
+        assert_eq!(resumed.unwrap().cumulative, 101);
+
+        for _ in 0..MAX_PROCESSED_USES {
+            let other = DelegatedUse::for_test(&session, &channel).await;
+            session.authorize_delegated_usage(&other, 1).await.unwrap();
+        }
+        let watermark = 101 + MAX_PROCESSED_USES as u64;
+        assert_eq!(
+            stored_channel(&session, &channel).await.cumulative,
+            watermark
+        );
+
+        let error = session
+            .authorize_delegated_usage(&stream, 50)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("charge record was evicted"),
+            "got: {error}"
+        );
+        assert_eq!(
+            stored_channel(&session, &channel).await.cumulative,
+            watermark,
+            "nothing is charged once the record is gone"
+        );
+    }
+
     #[tokio::test]
     async fn challenge_header_formats_session_challenge() {
         let header = test_session_mpp().challenge_header(None).unwrap();
@@ -5636,6 +6416,223 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Failed to get seal params"));
+    }
+
+    /// A close sealed a channel whose payer refund account could not take the
+    /// refund. The lifecycle keeps the record and retries the payout, which
+    /// lands once the payer repairs the account; until then nothing is sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deferred_payout_is_distributed_once_the_refund_account_is_repaired() {
+        deferred_payout_retry(Duration::from_millis(10)).await;
+    }
+
+    /// Automatic close disabled: a client close can still defer the payout,
+    /// and nothing but the lifecycle retries it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deferred_payout_is_retried_with_automatic_close_disabled() {
+        deferred_payout_retry(Duration::ZERO).await;
+    }
+
+    async fn deferred_payout_retry(close_delay: Duration) {
+        use axum::{Json, Router, routing::post};
+        use base64::Engine as _;
+        use pay_kit::mpp::program::payment_channels::generated::generated::{
+            accounts::Channel, types::SettlementWatermarks,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let operator = signer.pubkey();
+        let payer = solana_pubkey::Pubkey::new_unique();
+        let mint = solana_pubkey::Pubkey::new_unique();
+        let token_program =
+            solana_pubkey::Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let program = pay_kit::core::payment_channels::default_program_id();
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let refund_account = pay_kit::core::payment_channels::find_associated_token_address(
+            &payer,
+            &mint,
+            &token_program,
+        )
+        .0;
+        let sealed = borsh::to_vec(&Channel {
+            discriminator: 1,
+            version: 1,
+            bump: 255,
+            status: ChannelStatus::Sealed as u8,
+            salt: 7,
+            deposit: CAP,
+            settlement: SettlementWatermarks {
+                settled: 0,
+                payout_watermark: 0,
+            },
+            closure_started_at: 0,
+            payer_withdrawn_at: 0,
+            grace_period: 900,
+            distribution_hash: pay_kit::mpp::program::payment_channels::distribution_hash(&[]),
+            payer: pay_kit::core::payment_channels::to_address(&payer),
+            payee: pay_kit::core::payment_channels::to_address(&operator),
+            authorized_signer: pay_kit::core::payment_channels::to_address(&operator),
+            mint: pay_kit::core::payment_channels::to_address(&mint),
+            rent_payer: pay_kit::core::payment_channels::to_address(&payer),
+            open_slot: 42,
+        })
+        .unwrap();
+        let mut token_account = vec![0u8; 165];
+        token_account[..32].copy_from_slice(mint.as_ref());
+        token_account[32..64].copy_from_slice(payer.as_ref());
+        token_account[108] = 1;
+
+        let blockhash = solana_hash::Hash::new_unique().to_string();
+        let repaired = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let (rpc_repaired, rpc_sent) = (Arc::clone(&repaired), Arc::clone(&sent));
+        let app = Router::new().route(
+            "/",
+            post(move |Json(call): Json<serde_json::Value>| {
+                let (repaired, sent) = (Arc::clone(&rpc_repaired), Arc::clone(&rpc_sent));
+                let (sealed, token_account) = (sealed.clone(), token_account.clone());
+                let blockhash = blockhash.clone();
+                async move {
+                    let encode =
+                        |data: &[u8]| base64::engine::general_purpose::STANDARD.encode(data);
+                    let account = |owner: &solana_pubkey::Pubkey, data: &[u8]| {
+                        serde_json::json!({
+                            "data": [encode(data), "base64"], "executable": false,
+                            "lamports": 1_000_000u64, "owner": owner.to_string(),
+                            "rentEpoch": 0, "space": data.len()
+                        })
+                    };
+                    let result = match call["method"].as_str().unwrap_or_default() {
+                        "getMultipleAccounts" => {
+                            let value = call["params"][0]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|address| match address.as_str().unwrap() {
+                                    a if a == channel.to_string() => account(&program, &sealed),
+                                    a if a == refund_account.to_string()
+                                        && repaired.load(Ordering::SeqCst) =>
+                                    {
+                                        account(&token_program, &token_account)
+                                    }
+                                    _ => serde_json::Value::Null,
+                                })
+                                .collect::<Vec<_>>();
+                            serde_json::json!({"context": {"slot": 50}, "value": value})
+                        }
+                        "getLatestBlockhash" => serde_json::json!({
+                            "context": {"slot": 50},
+                            "value": {"blockhash": blockhash, "lastValidBlockHeight": 1_000}
+                        }),
+                        "getSlot" | "getBlockHeight" => serde_json::json!(50),
+                        "sendTransaction" => {
+                            sent.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!(
+                                pay_kit::mpp::program::payment_channels::decode_transaction(
+                                    call["params"][0].as_str().unwrap()
+                                )
+                                .unwrap()
+                                .signatures[0]
+                                    .to_string()
+                            )
+                        }
+                        "getSignatureStatuses" => serde_json::json!({
+                            "context": {"slot": 50},
+                            "value": [{
+                                "slot": 50, "confirmations": null, "err": null,
+                                "confirmationStatus": "finalized", "status": {"Ok": null}
+                            }]
+                        }),
+                        _ => {
+                            return Json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": call["id"],
+                                "error": {"code": -32601, "message": "not served"}
+                            }));
+                        }
+                    };
+                    Json(serde_json::json!({"jsonrpc": "2.0", "id": call["id"], "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = test_session_config();
+        config.operator = operator.to_string();
+        config.recipient = operator.to_string();
+        config.currency = mint.to_string();
+        config.token_program = Some(token_program);
+        config.voucher_signer = SessionVoucherSigner::Operator;
+        config.rpc_url = Some(rpc_url);
+        let session = Arc::new(
+            SessionMpp::new(config, "test-secret")
+                .with_blockhash_cache(test_blockhash_cache())
+                .with_payment_channel_signer(Arc::clone(&signer)),
+        );
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            close_delay,
+            Duration::from_millis(10),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::Embedded,
+        );
+        let challenge = session.challenge(None).unwrap();
+        let channel_id = channel.to_string();
+        seed_channel(
+            &session,
+            &channel_id,
+            CAP,
+            &operator.to_string(),
+            "operator",
+            &challenge.id,
+            &payer.to_string(),
+            None,
+        )
+        .await;
+        // With automatic close the embedded lifecycle owns the channel;
+        // without it the touch is a no-op and the record has no lifecycle.
+        session.touch_channel(channel_id.clone()).await.unwrap();
+        assert_eq!(
+            stored_channel(&session, &channel_id)
+                .await
+                .lifecycle
+                .is_some(),
+            !close_delay.is_zero()
+        );
+        let runtime = &session.operator_runtime;
+        runtime
+            .request_server_close(&channel_id, None)
+            .await
+            .unwrap();
+        let deferred = CloseSettlement {
+            signature: "seal".to_string(),
+            distributed: false,
+        };
+        runtime.finish_close(&channel_id, &deferred).await.unwrap();
+        let stored = stored_channel(&session, &channel_id).await;
+        assert!(
+            !stored.sealed,
+            "a deferred payout keeps the record for the lifecycle"
+        );
+        assert!(distribution_deferred_at(&stored).is_some());
+
+        // The refund account is still missing: lifecycle passes send nothing.
+        assert!(!runtime.distribute_deferred(&channel_id).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        assert!(!stored_channel(&session, &channel_id).await.sealed);
+
+        // Repaired: the lifecycle's next pass distributes and finishes it.
+        repaired.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stored_channel(&session, &channel_id).await.sealed {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the lifecycle distributes the deferred payout");
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
     }
 
     #[test]
