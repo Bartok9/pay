@@ -1132,9 +1132,7 @@ fn validate_pointer_escapes(pointer: &str) -> std::result::Result<(), String> {
             match chars.next() {
                 Some('0') | Some('1') => {}
                 _ => {
-                    return Err(
-                        "malformed JSON Pointer escape (expected ~0 or ~1)".into(),
-                    );
+                    return Err("malformed JSON Pointer escape (expected ~0 or ~1)".into());
                 }
             }
         }
@@ -3763,10 +3761,20 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
-            !findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error),
+            !findings
+                .iter()
+                .any(|f| f.severity == CatalogFindingSeverity::Error),
             "expected no errors, got: {findings:?}"
         );
     }
@@ -3785,10 +3793,20 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
-            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            !findings
+                .iter()
+                .any(|f| f.message.contains("unresolved local")),
             "escaped pointers should resolve, got: {findings:?}"
         );
     }
@@ -3804,8 +3822,16 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
             findings.iter().any(|f| {
                 f.severity == CatalogFindingSeverity::Error
@@ -3828,15 +3854,27 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         let messages: Vec<_> = findings.iter().map(|f| f.message.as_str()).collect();
         assert!(
-            messages.iter().any(|m| m.contains("#/foo~2") && m.contains("malformed")),
+            messages
+                .iter()
+                .any(|m| m.contains("#/foo~2") && m.contains("malformed")),
             "expected malformed escape error, got: {findings:?}"
         );
         assert!(
-            messages.iter().any(|m| m.contains("#foo") && m.contains("start with '/'")),
+            messages
+                .iter()
+                .any(|m| m.contains("#foo") && m.contains("start with '/'")),
             "expected missing-slash pointer error, got: {findings:?}"
         );
     }
@@ -3879,10 +3917,20 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
-            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            !findings
+                .iter()
+                .any(|f| f.message.contains("unresolved local")),
             "example $ref fields are data, got: {findings:?}"
         );
     }
@@ -3918,17 +3966,29 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         let messages: Vec<_> = findings.iter().map(|f| f.message.as_str()).collect();
         assert!(
-            messages.iter().any(|m| m.contains("#/components/examples/Missing")
-                && m.contains("responses.200.content.application/json.examples.sample")),
+            messages
+                .iter()
+                .any(|m| m.contains("#/components/examples/Missing")
+                    && m.contains("responses.200.content.application/json.examples.sample")),
             "expected media-type example ref error, got: {findings:?}"
         );
         assert!(
-            messages.iter().any(|m| m.contains("#/components/examples/AlsoMissing")
-                && m.contains("components.examples.Broken")),
+            messages
+                .iter()
+                .any(|m| m.contains("#/components/examples/AlsoMissing")
+                    && m.contains("components.examples.Broken")),
             "expected components.examples ref error, got: {findings:?}"
         );
         assert!(
@@ -3964,11 +4024,21 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
-            !findings.iter().any(|f| f.message.contains("unresolved local")
-                || f.message.contains("not-a-schema-pointer")),
+            !findings
+                .iter()
+                .any(|f| f.message.contains("unresolved local")
+                    || f.message.contains("not-a-schema-pointer")),
             "vendor-extension examples are payload, got: {findings:?}"
         );
     }
@@ -4014,16 +4084,28 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         let messages: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
         assert!(
-            !messages.iter().any(|m| m.contains("not-a-schema-pointer") || m.contains("also-payload")),
+            !messages
+                .iter()
+                .any(|m| m.contains("not-a-schema-pointer") || m.contains("also-payload")),
             "media-type extension examples are payload, got: {findings:?}"
         );
         assert!(
-            messages.iter().any(|m| m.contains("#/components/examples/MissingMedia")
-                && m.contains("application/vnd.x-widget+json.examples.sample")),
+            messages
+                .iter()
+                .any(|m| m.contains("#/components/examples/MissingMedia")
+                    && m.contains("application/vnd.x-widget+json.examples.sample")),
             "dotted media-type example ref should still fail, got: {findings:?}"
         );
     }
@@ -4061,17 +4143,29 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         let messages: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
         assert!(
-            messages.iter().any(|m| m.contains("#/components/examples/MissingHeader")
-                && m.contains("responses.200.headers.Rate-Limit.examples.sample")),
+            messages
+                .iter()
+                .any(|m| m.contains("#/components/examples/MissingHeader")
+                    && m.contains("responses.200.headers.Rate-Limit.examples.sample")),
             "expected header example ref error, got: {findings:?}"
         );
         assert!(
-            messages.iter().any(|m| m.contains("#/components/examples/MissingMedia")
-                && m.contains("application/vnd.x-widget+json.examples.sample")),
+            messages
+                .iter()
+                .any(|m| m.contains("#/components/examples/MissingMedia")
+                    && m.contains("application/vnd.x-widget+json.examples.sample")),
             "expected dotted media-type example ref error, got: {findings:?}"
         );
     }
@@ -4088,10 +4182,20 @@ mod tests {
                 }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
-            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            !findings
+                .iter()
+                .any(|f| f.message.contains("unresolved local")),
             "percent-encoded pointers should resolve, got: {findings:?}"
         );
     }
@@ -4105,8 +4209,16 @@ mod tests {
                 "/b": { "post": { "operationId": "listThings", "summary": "Create a thing from the payload" } }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
             findings.iter().any(|f| {
                 f.severity == CatalogFindingSeverity::Error
@@ -4130,10 +4242,21 @@ mod tests {
                     }
                 }
             });
-            let source = OpenapiSource::Content { content: doc.to_string() };
-            let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+            let source = OpenapiSource::Content {
+                content: doc.to_string(),
+            };
+            let findings = validate_committed_openapi_document(
+                &source,
+                &doc,
+                None,
+                "https://api.example.com",
+                None,
+            );
             assert!(
-                findings.iter().any(|f| f.message.contains("operationId `listThings`") && f.message.contains(method)),
+                findings
+                    .iter()
+                    .any(|f| f.message.contains("operationId `listThings`")
+                        && f.message.contains(method)),
                 "expected duplicate via {method}, got: {findings:?}"
             );
         }
@@ -4148,8 +4271,16 @@ mod tests {
                 "/b": { "post": { "operationId": "" } }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
             !findings.iter().any(|f| f.message.contains("operationId")),
             "blank operationIds are out of scope, got: {findings:?}"
@@ -4164,10 +4295,20 @@ mod tests {
                 "files": { "methods": { "get": { "httpMethod": "GET", "path": "files" } } }
             }
         });
-        let source = OpenapiSource::Content { content: doc.to_string() };
-        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
         assert!(
-            !findings.iter().any(|f| f.message.contains("operationId") || f.message.contains("unresolved local")),
+            !findings.iter().any(
+                |f| f.message.contains("operationId") || f.message.contains("unresolved local")
+            ),
             "discovery docs must be unchanged, got: {findings:?}"
         );
     }
